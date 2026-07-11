@@ -1,0 +1,9 @@
+{
+  "tor_browser_bundle_version": "15.0.17",
+  "tor_version": "0.4.9.11",
+  "platform": "windows-x86_64",
+  "url": "https://dist.torproject.org/torbrowser/15.0.17/tor-expert-bundle-windows-x86_64-15.0.17.tar.gz",
+  "signature_url": "https://dist.torproject.org/torbrowser/15.0.17/tor-expert-bundle-windows-x86_64-15.0.17.tar.gz.asc",
+  "sha256": "5f91e9426bf641dfe539dc28029088c72bed0b1d8f1c79104a0f89273cb3ebe1"
+}
+

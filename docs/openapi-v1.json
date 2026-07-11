@@ -1,0 +1,874 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Blackspace private-alpha messaging protocol",
+    "description": "Unaudited private-alpha protocol for invited, identity-bound, end-to-end encrypted one-to-one messaging over opaque mailbox servers.",
+    "license": {
+      "name": ""
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/v1/deposit/envelopes": {
+      "post": {
+        "tags": [],
+        "operationId": "api_deposit_envelope",
+        "requestBody": {
+          "content": {
+            "application/blackspace-envelope+json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnvelopeV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DepositAcceptedV1"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/deposit/key-packages/claim": {
+      "post": {
+        "tags": [],
+        "operationId": "api_claim_key_package",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaimKeyPackageResponseV1"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/info": {
+      "get": {
+        "tags": [],
+        "operationId": "api_server_info",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerInfoV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mailbox/ack": {
+      "post": {
+        "tags": [],
+        "operationId": "api_acknowledge_envelopes",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AckRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AckResponseV1"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mailbox/deposit-capabilities": {
+      "post": {
+        "tags": [],
+        "operationId": "api_create_deposit_capability",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDepositCapabilityRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateDepositCapabilityResponseV1"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mailbox/deposit-capabilities/{capability_id}": {
+      "delete": {
+        "tags": [],
+        "operationId": "api_revoke_deposit_capability",
+        "parameters": [
+          {
+            "name": "capability_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mailbox/key-packages": {
+      "post": {
+        "tags": [],
+        "operationId": "api_publish_key_packages",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublishKeyPackagesRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublishKeyPackagesResponseV1"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mailbox/pull": {
+      "post": {
+        "tags": [],
+        "operationId": "api_pull_envelopes",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PullRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PullResponseV1"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mailbox/recover": {
+      "post": {
+        "tags": [],
+        "operationId": "api_recover_mailbox",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoverMailboxRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoverMailboxResponseV1"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mailboxes": {
+      "post": {
+        "tags": [],
+        "operationId": "api_provision_mailbox",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MailboxProvisionRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MailboxProvisionResponseV1"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AckRequestV1": {
+        "type": "object",
+        "required": [
+          "acknowledgement_tokens"
+        ],
+        "properties": {
+          "acknowledgement_tokens": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "AckResponseV1": {
+        "type": "object",
+        "required": [
+          "acknowledged"
+        ],
+        "properties": {
+          "acknowledged": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ClaimKeyPackageResponseV1": {
+        "type": "object",
+        "required": [
+          "key_package"
+        ],
+        "properties": {
+          "key_package": {
+            "$ref": "#/components/schemas/KeyPackageV1"
+          }
+        }
+      },
+      "CreateDepositCapabilityRequestV1": {
+        "type": "object",
+        "required": [
+          "verifier"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "verifier": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateDepositCapabilityResponseV1": {
+        "type": "object",
+        "required": [
+          "capability_id"
+        ],
+        "properties": {
+          "capability_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "DepositAcceptedV1": {
+        "type": "object",
+        "required": [
+          "accepted"
+        ],
+        "properties": {
+          "accepted": {
+            "type": "boolean"
+          }
+        }
+      },
+      "DepositTargetV1": {
+        "type": "object",
+        "required": [
+          "onion_url",
+          "deposit_capability"
+        ],
+        "properties": {
+          "deposit_capability": {
+            "type": "string"
+          },
+          "https_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "onion_url": {
+            "type": "string"
+          }
+        }
+      },
+      "EnvelopeV1": {
+        "type": "object",
+        "required": [
+          "version",
+          "envelope_id",
+          "expires_at",
+          "size_class",
+          "ciphertext"
+        ],
+        "properties": {
+          "ciphertext": {
+            "type": "string"
+          },
+          "envelope_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "size_class": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "FeatureFlagsV1": {
+        "type": "object",
+        "required": [
+          "opaque_transport",
+          "key_packages",
+          "mls",
+          "registration_invites",
+          "recovery_takeover"
+        ],
+        "properties": {
+          "key_packages": {
+            "type": "boolean"
+          },
+          "mls": {
+            "type": "boolean"
+          },
+          "opaque_transport": {
+            "type": "boolean"
+          },
+          "recovery_takeover": {
+            "type": "boolean"
+          },
+          "registration_invites": {
+            "type": "boolean"
+          }
+        }
+      },
+      "KeyPackageV1": {
+        "type": "object",
+        "description": "An opaque, client-signed MLS key package. The mailbox validates bounds and\nexpiry; the claiming client authenticates it against `identity_public_key`.",
+        "required": [
+          "package_id",
+          "protocol_version",
+          "ciphersuite",
+          "identity_public_key",
+          "key_package",
+          "expires_at"
+        ],
+        "properties": {
+          "ciphersuite": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "identity_public_key": {
+            "type": "string"
+          },
+          "key_package": {
+            "type": "string"
+          },
+          "package_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "protocol_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "MailboxProvisionRequestV1": {
+        "type": "object",
+        "required": [
+          "identity_public_key",
+          "read_capability_verifier",
+          "admin_capability_verifier",
+          "initial_deposit_capability_verifier",
+          "key_packages"
+        ],
+        "properties": {
+          "admin_capability_verifier": {
+            "type": "string"
+          },
+          "identity_public_key": {
+            "type": "string"
+          },
+          "initial_deposit_capability_verifier": {
+            "type": "string"
+          },
+          "initial_deposit_expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "key_packages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KeyPackageV1"
+            }
+          },
+          "read_capability_verifier": {
+            "type": "string"
+          }
+        }
+      },
+      "MailboxProvisionResponseV1": {
+        "type": "object",
+        "required": [
+          "mailbox_id",
+          "initial_deposit_capability_id"
+        ],
+        "properties": {
+          "initial_deposit_capability_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "mailbox_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "ProblemV1": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "PublishKeyPackagesRequestV1": {
+        "type": "object",
+        "required": [
+          "key_packages"
+        ],
+        "properties": {
+          "key_packages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KeyPackageV1"
+            }
+          }
+        }
+      },
+      "PublishKeyPackagesResponseV1": {
+        "type": "object",
+        "required": [
+          "accepted",
+          "available"
+        ],
+        "properties": {
+          "accepted": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "available": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "PullRequestV1": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "PullResponseV1": {
+        "type": "object",
+        "required": [
+          "envelopes"
+        ],
+        "properties": {
+          "envelopes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PulledEnvelopeV1"
+            }
+          }
+        }
+      },
+      "PulledEnvelopeV1": {
+        "type": "object",
+        "required": [
+          "version",
+          "envelope_id",
+          "expires_at",
+          "size_class",
+          "ciphertext",
+          "acknowledgement_token",
+          "deposit_capability_id"
+        ],
+        "properties": {
+          "acknowledgement_token": {
+            "type": "string"
+          },
+          "ciphertext": {
+            "type": "string"
+          },
+          "deposit_capability_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "envelope_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "size_class": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "RecoverMailboxRequestV1": {
+        "type": "object",
+        "required": [
+          "identity_public_key",
+          "read_capability_verifier",
+          "admin_capability_verifier",
+          "deposit_capabilities",
+          "key_packages"
+        ],
+        "properties": {
+          "admin_capability_verifier": {
+            "type": "string"
+          },
+          "deposit_capabilities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CreateDepositCapabilityRequestV1"
+            }
+          },
+          "identity_public_key": {
+            "type": "string"
+          },
+          "key_packages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KeyPackageV1"
+            }
+          },
+          "read_capability_verifier": {
+            "type": "string"
+          }
+        }
+      },
+      "RecoverMailboxResponseV1": {
+        "type": "object",
+        "required": [
+          "mailbox_id",
+          "deposit_capability_ids",
+          "purged_envelopes"
+        ],
+        "properties": {
+          "deposit_capability_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "mailbox_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "purged_envelopes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ServerInfoV1": {
+        "type": "object",
+        "required": [
+          "instance_name",
+          "protocol_versions",
+          "maximum_envelope_bytes",
+          "envelope_size_classes",
+          "maximum_queued_envelopes",
+          "default_retention_seconds",
+          "maximum_retention_seconds",
+          "maximum_pull_batch",
+          "features"
+        ],
+        "properties": {
+          "default_retention_seconds": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "envelope_size_classes": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "features": {
+            "$ref": "#/components/schemas/FeatureFlagsV1"
+          },
+          "https_origin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instance_name": {
+            "type": "string"
+          },
+          "maximum_envelope_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "maximum_pull_batch": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "maximum_queued_envelopes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "maximum_retention_seconds": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "onion_origin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "protocol_versions": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        }
+      },
+      "TransportMode": {
+        "type": "string",
+        "enum": [
+          "tor-native",
+          "tor-web",
+          "https-web",
+          "compatibility-web-dev"
+        ]
+      }
+    }
+  }
+}

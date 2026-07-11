@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.5-alpine
+        env:
+          POSTGRES_DB: blackspace_test
+          POSTGRES_USER: blackspace
+          POSTGRES_PASSWORD: blackspace_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U blackspace -d blackspace_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.12.0
+      - run: npm install --global pnpm@10.2.1
+      - run: pnpm install --frozen-lockfile
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+        env:
+          BLACKSPACE_TEST_DATABASE_URL: postgresql://blackspace:blackspace_test@127.0.0.1:5432/blackspace_test
+      - run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - run: cargo build -p blackspace-core --release --target wasm32-unknown-unknown
+      - run: wasm-bindgen target/wasm32-unknown-unknown/release/blackspace_core.wasm --target web --out-dir target/wasm-contract --out-name blackspace_core
+      - run: diff -u apps/pwa/src/wasm/blackspace_core.js target/wasm-contract/blackspace_core.js && diff -u apps/pwa/src/wasm/blackspace_core.d.ts target/wasm-contract/blackspace_core.d.ts && diff -u apps/pwa/src/wasm/blackspace_core_bg.wasm.d.ts target/wasm-contract/blackspace_core_bg.wasm.d.ts
+      - run: pnpm contracts:check
+      - run: pnpm security:check
+      - run: pnpm check
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm --filter @blackspace/pwa exec playwright install --with-deps chromium
+      - run: pnpm --filter @blackspace/pwa test:e2e
+      - run: sh scripts/init-dev-secrets.sh >/dev/null
+      - run: docker compose -f deploy/docker/compose.yaml config --quiet
+
+  windows-desktop:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.12.0
+      - run: npm install --global pnpm@10.2.1
+      - run: pnpm install --frozen-lockfile
+      - run: .\scripts\fetch-tor.ps1
+      - run: cargo test -p blackspace-desktop
+      - run: pnpm --filter @blackspace/desktop tauri build

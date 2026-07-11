@@ -1,0 +1,11 @@
+.git
+.gitignore
+target
+node_modules
+**/node_modules
+**/dist
+**/target
+apps/desktop-windows/src-tauri/binaries
+apps/desktop-windows/src-tauri/tor-support
+deploy/docker/secrets
+*.log

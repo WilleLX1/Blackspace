@@ -1,0 +1,19 @@
+{
+  "name": "blackspace",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.2.1",
+  "scripts": {
+    "build": "pnpm --filter @blackspace/pwa build",
+    "check": "pnpm --filter @blackspace/pwa check",
+    "test": "pnpm --filter @blackspace/pwa test",
+    "dev": "pnpm --filter @blackspace/pwa dev",
+    "desktop": "pnpm --filter @blackspace/desktop tauri dev",
+    "contracts:generate": "node scripts/generate-contracts.mjs",
+    "contracts:check": "node scripts/generate-contracts.mjs --check",
+    "security:check": "node scripts/check-security-config.mjs"
+  },
+  "devDependencies": {
+    "openapi-typescript": "^7.8.0"
+  }
+}

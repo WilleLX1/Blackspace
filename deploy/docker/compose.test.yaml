@@ -1,0 +1,11 @@
+# Explicit test-only override. Never use this file for a deployed server.
+services:
+  database:
+    ports:
+      - "127.0.0.1:15432:5432"
+    networks:
+      - database_internal
+      - test_ingress
+
+networks:
+  test_ingress: {}

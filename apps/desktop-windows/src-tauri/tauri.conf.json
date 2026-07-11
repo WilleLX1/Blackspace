@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Blackspace",
+  "version": "0.1.0",
+  "identifier": "org.blackspace.app",
+  "build": {
+    "beforeDevCommand": "npx --yes pnpm@10.2.1 --dir ../pwa dev",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "npx --yes pnpm@10.2.1 --dir ../pwa build",
+    "frontendDist": "../../pwa/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Blackspace — Tor Native",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 820,
+        "minHeight": 640,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'none'; img-src 'self' data:; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "externalBin": ["binaries/tor"],
+    "resources": ["tor-support/*"]
+  }
+}

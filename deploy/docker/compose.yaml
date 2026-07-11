@@ -1,0 +1,161 @@
+name: blackspace
+
+services:
+  database:
+    image: postgres:17.5-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: blackspace
+      POSTGRES_USER: blackspace
+      POSTGRES_PASSWORD_FILE: /run/secrets/database_password
+    secrets:
+      - database_password
+    volumes:
+      - mailbox_database:/var/lib/postgresql/data
+    networks:
+      - database_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blackspace -d blackspace"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+
+  mailbox:
+    build:
+      context: ../..
+      dockerfile: services/mailbox/Dockerfile
+    restart: unless-stopped
+    environment:
+      BLACKSPACE_ENV: production
+      BLACKSPACE_LISTEN_ADDR: 0.0.0.0:8080
+      BLACKSPACE_DATABASE_URL_FILE: /run/secrets/database_url
+      BLACKSPACE_INSTANCE_NAME: ${BLACKSPACE_INSTANCE_NAME:-Blackspace Private Alpha}
+      BLACKSPACE_ONION_ORIGIN: ${BLACKSPACE_ONION_ORIGIN:-}
+      BLACKSPACE_HTTPS_ORIGIN: ${BLACKSPACE_HTTPS_ORIGIN:-}
+      RUST_LOG: blackspace_mailbox=info
+    secrets:
+      - database_url
+    depends_on:
+      database:
+        condition: service_healthy
+    networks:
+      - database_internal
+      - onion_internal
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  edge:
+    build:
+      context: ../..
+      dockerfile: apps/pwa/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - mailbox
+    networks:
+      - onion_internal
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  tor:
+    image: containers.torproject.org/tpo/onion-services/onimages/tor:alpine@sha256:29befcbf548717bd1ac35b7a795d66909a866bf7aedf98df0728edd5381ff360
+    restart: unless-stopped
+    command:
+      - --SocksPort
+      - "0"
+      - --HiddenServiceDir
+      - /var/lib/tor/blackspace
+      - --HiddenServicePort
+      - "80 edge:8080"
+      - --SafeLogging
+      - "1"
+      - --Log
+      - "notice stdout"
+    depends_on:
+      - edge
+    volumes:
+      - onion_keys:/var/lib/tor
+    networks:
+      - onion_internal
+      - tor_egress
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+      - /run:size=8m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+
+  web-dev:
+    profiles: ["web-dev"]
+    build:
+      context: ../..
+      dockerfile: apps/pwa/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - mailbox
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - onion_internal
+      - web_dev_ingress
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  https-gateway:
+    profiles: ["https"]
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    environment:
+      BLACKSPACE_HTTPS_DOMAIN: ${BLACKSPACE_HTTPS_DOMAIN:-localhost}
+      BLACKSPACE_ACME_EMAIL: ${BLACKSPACE_ACME_EMAIL:-invalid@example.invalid}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - edge
+    networks:
+      - onion_internal
+      - https_ingress
+    security_opt:
+      - no-new-privileges:true
+
+secrets:
+  database_password:
+    file: ./secrets/database_password
+  database_url:
+    file: ./secrets/database_url
+
+networks:
+  onion_internal:
+    internal: true
+  database_internal:
+    internal: true
+  tor_egress: {}
+  web_dev_ingress: {}
+  https_ingress: {}
+
+volumes:
+  mailbox_database: {}
+  onion_keys: {}
+  caddy_data: {}
+  caddy_config: {}

@@ -1,0 +1,6 @@
+services:
+  # The currently pinned Tor Project Onimages artifact is published for AMD64.
+  # Emulate only this small container; the mailbox, web edge, and PostgreSQL
+  # images continue to build/run natively on ARM64.
+  tor:
+    platform: linux/amd64

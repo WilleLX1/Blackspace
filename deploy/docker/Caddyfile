@@ -1,0 +1,23 @@
+{
+  email {$BLACKSPACE_ACME_EMAIL}
+  admin off
+}
+
+{$BLACKSPACE_HTTPS_DOMAIN} {
+  encode zstd gzip
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    Referrer-Policy "no-referrer"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "DENY"
+    -Server
+  }
+  reverse_proxy edge:8080 {
+    header_up X-Forwarded-For ""
+    header_up X-Real-IP ""
+    header_up Forwarded ""
+  }
+  log {
+    output discard
+  }
+}
