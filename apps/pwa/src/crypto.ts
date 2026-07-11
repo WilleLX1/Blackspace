@@ -41,7 +41,12 @@ function strictOnionOrigin(value: string): string {
 function optionalHttps(value: string | null): string | undefined {
   if (!value) return undefined;
   const url = new URL(value);
-  if (url.protocol !== "https:" || url.port || url.username || url.password || url.pathname !== "/") {
+  // A non-default port is permitted so an operator can leave 443 to another
+  // service and expose Blackspace's HTTPS gateway elsewhere (e.g. :8443). The
+  // rest of the origin stays locked down: https only, no embedded credentials,
+  // and no path/query/fragment smuggled through the invitation. url.origin
+  // preserves the explicit port when present and omits it for the default 443.
+  if (url.protocol !== "https:" || url.username || url.password || url.pathname !== "/") {
     throw new Error("The HTTPS gateway in the invitation is invalid.");
   }
   return url.origin;

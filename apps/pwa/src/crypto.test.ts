@@ -20,6 +20,38 @@ describe("private-alpha client framing", () => {
     expect(parseContactInvitation(invitation)).toMatchObject({ capability, identityPublicKey: identity, onionOrigin: onion });
   });
 
+  it("accepts a custom HTTPS gateway port and preserves it", () => {
+    const capability = randomCapability();
+    const identity = randomCapability();
+    const invitation = formatContactInvitation(
+      { onion_url: onion, https_url: "https://gateway.example.com:8443", deposit_capability: capability },
+      identity,
+      "123e4567-e89b-42d3-a456-426614174000",
+    );
+    expect(parseContactInvitation(invitation).httpsOrigin).toBe("https://gateway.example.com:8443");
+  });
+
+  it("still normalizes the default HTTPS port away", () => {
+    const invitation = formatContactInvitation(
+      { onion_url: onion, https_url: "https://gateway.example.com:443", deposit_capability: randomCapability() },
+      randomCapability(),
+      "123e4567-e89b-42d3-a456-426614174000",
+    );
+    expect(parseContactInvitation(invitation).httpsOrigin).toBe("https://gateway.example.com");
+  });
+
+  it("still rejects HTTPS gateways carrying a path or credentials", () => {
+    const identity = randomCapability();
+    for (const https_url of ["https://gateway.example.com/mailbox", "https://user:pass@gateway.example.com", "http://gateway.example.com:8443"]) {
+      const invitation = formatContactInvitation(
+        { onion_url: onion, https_url, deposit_capability: randomCapability() },
+        identity,
+        "123e4567-e89b-42d3-a456-426614174000",
+      );
+      expect(() => parseContactInvitation(invitation)).toThrow();
+    }
+  });
+
   it("uses purpose-separated capability verifiers", async () => {
     const capability = randomCapability();
     expect(fromBase64Url(capability)).toHaveLength(32);
