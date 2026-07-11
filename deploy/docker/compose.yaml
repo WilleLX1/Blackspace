@@ -26,6 +26,10 @@ services:
     build:
       context: ../..
       dockerfile: services/mailbox/Dockerfile
+    # Linux Compose bind-mounts file-backed secrets without remapping ownership.
+    # Set these to the UID/GID that owns deploy/docker/secrets/database_url.
+    # The image's locked-down 10001:10001 account remains the safe default.
+    user: "${BLACKSPACE_MAILBOX_UID:-10001}:${BLACKSPACE_MAILBOX_GID:-10001}"
     restart: unless-stopped
     environment:
       BLACKSPACE_ENV: production

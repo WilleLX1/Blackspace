@@ -96,6 +96,8 @@ Create private database secrets and start the onion-only stack:
 
 ```sh
 sh scripts/init-dev-secrets.sh
+BLACKSPACE_MAILBOX_UID="$(id -u)" \
+BLACKSPACE_MAILBOX_GID="$(id -g)" \
 docker compose \
   -f deploy/docker/compose.yaml \
   -f deploy/docker/compose.raspberry-pi.yaml \
@@ -106,7 +108,18 @@ On an AMD64 Linux server, omit the Raspberry Pi override:
 
 ```sh
 sh scripts/init-dev-secrets.sh
+BLACKSPACE_MAILBOX_UID="$(id -u)" \
+BLACKSPACE_MAILBOX_GID="$(id -g)" \
 docker compose -f deploy/docker/compose.yaml up -d --build
+```
+
+Linux Compose bind-mounts file-backed secrets with their host ownership intact. The UID/GID variables make the non-root mailbox process match the user that created `deploy/docker/secrets/database_url`; they do not run it as root or make the secret readable to other users. Include the same two variables whenever you recreate the mailbox container.
+
+If the secrets were previously created with `sudo`, return them to your login user before starting the stack:
+
+```sh
+sudo chown "$(id -u):$(id -g)" deploy/docker/secrets/database_password deploy/docker/secrets/database_url
+chmod 600 deploy/docker/secrets/database_password deploy/docker/secrets/database_url
 ```
 
 The first Raspberry Pi build may take tens of minutes because it compiles the Rust mailbox locally. Check that the database is healthy and the remaining services are running:
@@ -141,6 +154,27 @@ The Docker volumes named `blackspace_onion_keys` and `blackspace_mailbox_databas
 
 This quick start creates a fresh server. Copying only the repository does **not** transfer existing accounts. Moving a live installation from Docker Desktop requires an offline migration of both named volumes and the secrets directory; stop the old server first and do not run the old and new copies simultaneously with the same onion keys.
 
+### Linux troubleshooting
+
+If `blackspace-mailbox-1` repeatedly exits with `Permission denied (os error 13)`, the database URL secret is owned by a different host UID than the non-root mailbox process. Keep the secret at mode `0600`; do not fix this with `chmod 644`.
+
+Recreate only the mailbox and its dependent edge after correcting ownership:
+
+```sh
+sudo chown "$(id -u):$(id -g)" deploy/docker/secrets/database_url
+chmod 600 deploy/docker/secrets/database_url
+BLACKSPACE_MAILBOX_UID="$(id -u)" \
+BLACKSPACE_MAILBOX_GID="$(id -g)" \
+docker compose \
+  -f deploy/docker/compose.yaml \
+  -f deploy/docker/compose.raspberry-pi.yaml \
+  up -d --force-recreate mailbox edge
+
+docker compose -f deploy/docker/compose.yaml logs --tail=100 mailbox
+```
+
+On AMD64 Linux, omit `-f deploy/docker/compose.raspberry-pi.yaml`. Running Compose itself with `sudo` does not change the UID inside an already-defined container, which is why `sudo docker compose` alone cannot resolve this error. If your login requires sudo for Docker, put the variables inside sudo's environment: `sudo env BLACKSPACE_MAILBOX_UID="$(id -u)" BLACKSPACE_MAILBOX_GID="$(id -g)" docker compose ...`.
+
 ## Windows Tor Native
 
 Fetch and verify the pinned Windows Tor Expert Bundle, then run Tauri:
@@ -163,6 +197,8 @@ The bundle is excluded from Git and verified against [tor-bundle.lock.json](tor-
 3. The other user chooses **Add contact**, pastes or scans it, and sends a first message.
 4. The recipient reviews the conversation under **Message requests** and accepts or blocks it.
 5. Both users compare the full fingerprint in **Verify identity** using another trusted channel.
+
+Mailbox registration is idempotent for an identical in-memory signup attempt. If Tor Browser reports that registration was interrupted, leave the invitation and display name unchanged and press **Create my private space** again. Do not reload the page first; reloading intentionally discards the client-generated capabilities.
 
 Each contact invitation contains a distinct write-only deposit capability and public identity. It never grants mailbox read or administration access. Secrets are URI fragments and are not sent in HTTP request paths.
 

@@ -20,6 +20,7 @@ import { base64Url } from "./crypto";
 import { errorMessage } from "./errors";
 import { contactFingerprint, decodeSecureContent, encodeSecureContent, mlsCreateMessage, mlsGenerate, mlsGroupHint, mlsJoin, mlsProcessMessage, mlsRecoveryIdentitySnapshot, mlsReplenish, mlsStart } from "./mls";
 import type { AccountState, ContactRecord, DepositTarget, KeyPackageWire, MessageRecord } from "./model";
+import { onboardingError, type OnboardingStage } from "./onboarding";
 import { detectTransportMode, deriveTransportMode, modeLabel } from "./security";
 import { createRecoveryKit, deleteVault, lockVault, openRecoveryKit, saveVault, unlockVault, vaultExists } from "./vault";
 
@@ -57,9 +58,18 @@ function WelcomeScreen({ onComplete }: { onComplete(state: AccountState, passphr
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const recoveryInput = useRef<HTMLInputElement>(null);
+  const attempt = useRef<{
+    key: string;
+    readCapability: string;
+    adminCapability: string;
+    identityPublicKey: string;
+    mlsClientState: string;
+    request: object;
+  } | null>(null);
 
   const create = async () => {
     setBusy(true); setError("");
+    let stage: OnboardingStage = "server check";
     try {
       if (displayName.trim().length < 2 || displayName.trim().length > 64) throw new Error("Choose a display name between 2 and 64 characters.");
       if (passphrase.length < 10 || passphrase !== confirm) throw new Error("Use a matching vault passphrase of at least 10 characters.");
@@ -67,29 +77,43 @@ function WelcomeScreen({ onComplete }: { onComplete(state: AccountState, passphr
       const origin = ownOrigin(join.onionOrigin, join.httpsOrigin);
       const info = await serverInfo(origin);
       if (!info.features.mls || !info.features.registration_invites) throw new Error("This server does not support the v0.1 private-alpha protocol.");
-      const readCapability = randomCapability();
-      const adminCapability = randomCapability();
-      const depositCapability = randomCapability();
-      const identity = await mlsGenerate(20);
-      const packages = wirePackages(identity.key_packages, identity.identity_public_key);
-      const provisioned = await provisionMailbox(origin, join.token, {
-        identity_public_key: identity.identity_public_key,
-        read_capability_verifier: await capabilityVerifier("read", readCapability),
-        admin_capability_verifier: await capabilityVerifier("admin", adminCapability),
-        initial_deposit_capability_verifier: await capabilityVerifier("deposit", depositCapability),
-        initial_deposit_expires_at: null,
-        key_packages: packages,
-      });
+      const attemptKey = `${invitation.trim()}\0${displayName.trim()}`;
+      if (!attempt.current || attempt.current.key !== attemptKey) {
+        const readCapability = randomCapability();
+        const adminCapability = randomCapability();
+        const depositCapability = randomCapability();
+        const identity = await mlsGenerate(20);
+        attempt.current = {
+          key: attemptKey,
+          readCapability,
+          adminCapability,
+          identityPublicKey: identity.identity_public_key,
+          mlsClientState: identity.client_state,
+          request: {
+            identity_public_key: identity.identity_public_key,
+            read_capability_verifier: await capabilityVerifier("read", readCapability),
+            admin_capability_verifier: await capabilityVerifier("admin", adminCapability),
+            initial_deposit_capability_verifier: await capabilityVerifier("deposit", depositCapability),
+            initial_deposit_expires_at: null,
+            key_packages: wirePackages(identity.key_packages, identity.identity_public_key),
+          },
+        };
+      }
+      const current = attempt.current;
+      stage = "mailbox registration";
+      const provisioned = await provisionMailbox(origin, join.token, current.request);
       const state: AccountState = {
         version: 1, displayName: displayName.trim(), instanceName: info.instance_name,
         mailboxId: provisioned.mailbox_id, onionOrigin: join.onionOrigin, httpsOrigin: join.httpsOrigin,
-        readCapability, adminCapability, identityPublicKey: identity.identity_public_key,
-        mlsClientState: identity.client_state, availableKeyPackages: 20,
+        readCapability: current.readCapability, adminCapability: current.adminCapability, identityPublicKey: current.identityPublicKey,
+        mlsClientState: current.mlsClientState, availableKeyPackages: 20,
         contacts: [], messages: [], createdAt: Date.now(),
       };
+      stage = "encrypted local storage";
       await saveVault(state, passphrase);
+      attempt.current = null;
       onComplete(state, passphrase);
-    } catch (cause) { setError(errorMessage(cause, "Onboarding failed.")); }
+    } catch (cause) { setError(onboardingError(cause, stage)); }
     finally { setBusy(false); }
   };
 

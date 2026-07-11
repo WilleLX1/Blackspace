@@ -65,6 +65,13 @@ $provisionBody = @{
 $mailbox = Invoke-RestMethod -Method Post -Uri "$BaseUrl/v1/mailboxes" -Headers @{
     Authorization = "BlackspaceRegistration $RegistrationToken"
 } -ContentType "application/json" -Body $provisionBody
+$mailboxRetry = Invoke-RestMethod -Method Post -Uri "$BaseUrl/v1/mailboxes" -Headers @{
+    Authorization = "BlackspaceRegistration $RegistrationToken"
+} -ContentType "application/json" -Body $provisionBody
+if ($mailboxRetry.mailbox_id -ne $mailbox.mailbox_id -or
+    $mailboxRetry.initial_deposit_capability_id -ne $mailbox.initial_deposit_capability_id) {
+    throw "An identical registration retry did not return the original mailbox."
+}
 
 $ciphertextBytes = [byte[]]::new(4096)
 $rng = [Security.Cryptography.RandomNumberGenerator]::Create()

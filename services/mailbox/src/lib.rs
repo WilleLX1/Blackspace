@@ -339,14 +339,65 @@ async fn provision_mailbox(
         return Err(invalid_registration("key_packages_empty"));
     }
 
-    let mailbox_id = Uuid::new_v4();
-    let deposit_id = Uuid::new_v4();
     let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     let invite = sqlx::query(
-        "SELECT id FROM registration_invitations WHERE verifier = $1 AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > now() FOR UPDATE"
-    ).bind(registration.as_slice()).fetch_optional(&mut *tx).await.map_err(ApiError::internal)?
-        .ok_or_else(ApiError::unauthorized)?;
+        "SELECT r.id,r.expires_at,r.consumed_at,r.mailbox_id,r.initial_deposit_capability_id,
+                m.read_capability_verifier,m.admin_capability_verifier,m.identity_public_key,
+                d.verifier AS deposit_capability_verifier
+         FROM registration_invitations r
+         LEFT JOIN mailboxes m ON m.id=r.mailbox_id
+         LEFT JOIN deposit_capabilities d ON d.id=r.initial_deposit_capability_id
+         WHERE r.verifier=$1 AND r.revoked_at IS NULL
+         FOR UPDATE OF r",
+    )
+    .bind(registration.as_slice())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(ApiError::unauthorized)?;
     let invite_id: Uuid = invite.get("id");
+    if invite
+        .get::<Option<OffsetDateTime>, _>("consumed_at")
+        .is_some()
+    {
+        let mailbox_id = invite
+            .get::<Option<Uuid>, _>("mailbox_id")
+            .ok_or_else(|| ApiError::internal("consumed invitation has no mailbox"))?;
+        let deposit_id = invite
+            .get::<Option<Uuid>, _>("initial_deposit_capability_id")
+            .ok_or_else(|| ApiError::internal("consumed invitation has no deposit capability"))?;
+        let stored_read = invite.get::<Option<Vec<u8>>, _>("read_capability_verifier");
+        let stored_admin = invite.get::<Option<Vec<u8>>, _>("admin_capability_verifier");
+        let stored_deposit = invite.get::<Option<Vec<u8>>, _>("deposit_capability_verifier");
+        let stored_identity = invite.get::<Option<String>, _>("identity_public_key");
+        let same_attempt = stored_read
+            .as_deref()
+            .is_some_and(|value| bool::from(value.ct_eq(read.as_slice())))
+            && stored_admin
+                .as_deref()
+                .is_some_and(|value| bool::from(value.ct_eq(admin.as_slice())))
+            && stored_deposit
+                .as_deref()
+                .is_some_and(|value| bool::from(value.ct_eq(deposit.as_slice())))
+            && stored_identity.as_deref() == Some(request.identity_public_key.as_str());
+        if !same_attempt {
+            return Err(ApiError::unauthorized());
+        }
+        tx.commit().await.map_err(ApiError::internal)?;
+        return Ok((
+            StatusCode::OK,
+            Json(MailboxProvisionResponseV1 {
+                mailbox_id,
+                initial_deposit_capability_id: deposit_id,
+            }),
+        ));
+    }
+    if invite.get::<OffsetDateTime, _>("expires_at") <= OffsetDateTime::now_utc() {
+        return Err(ApiError::unauthorized());
+    }
+
+    let mailbox_id = Uuid::new_v4();
+    let deposit_id = Uuid::new_v4();
     sqlx::query("INSERT INTO mailboxes (id, read_capability_verifier, admin_capability_verifier, identity_public_key) VALUES ($1,$2,$3,$4)")
         .bind(mailbox_id).bind(read.as_slice()).bind(admin.as_slice()).bind(&request.identity_public_key)
         .execute(&mut *tx).await.map_err(|error| map_conflict(error, "mailbox_conflict"))?;
@@ -354,8 +405,10 @@ async fn provision_mailbox(
         .bind(deposit_id).bind(mailbox_id).bind(deposit.as_slice()).bind(deposit_expiry)
         .execute(&mut *tx).await.map_err(ApiError::internal)?;
     insert_key_packages(&mut tx, mailbox_id, packages).await?;
-    sqlx::query("UPDATE registration_invitations SET consumed_at = now() WHERE id = $1")
+    sqlx::query("UPDATE registration_invitations SET consumed_at=now(),mailbox_id=$2,initial_deposit_capability_id=$3 WHERE id=$1")
         .bind(invite_id)
+        .bind(mailbox_id)
+        .bind(deposit_id)
         .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
