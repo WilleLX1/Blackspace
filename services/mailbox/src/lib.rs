@@ -98,19 +98,55 @@ fn env_or_file(name: &str) -> anyhow::Result<String> {
     Ok(value)
 }
 
-#[derive(Default)]
 struct DepositRateLimiter {
-    attempts: Mutex<HashMap<[u8; 32], VecDeque<Instant>>>,
+    attempts: Mutex<DepositRateWindows>,
+}
+
+struct DepositRateWindows {
+    windows: HashMap<[u8; 32], VecDeque<Instant>>,
+    last_sweep: Instant,
+}
+
+impl Default for DepositRateLimiter {
+    fn default() -> Self {
+        Self {
+            attempts: Mutex::new(DepositRateWindows {
+                windows: HashMap::new(),
+                last_sweep: Instant::now(),
+            }),
+        }
+    }
 }
 
 impl DepositRateLimiter {
+    const WINDOW: Duration = Duration::from_secs(60);
+
     fn allow(&self, key: [u8; 32]) -> bool {
-        let now = Instant::now();
-        let mut attempts = self.attempts.lock().expect("rate limiter mutex poisoned");
-        let window = attempts.entry(key).or_default();
+        self.allow_at(key, Instant::now())
+    }
+
+    fn allow_at(&self, key: [u8; 32], now: Instant) -> bool {
+        let mut state = self.attempts.lock().expect("rate limiter mutex poisoned");
+        // The rate key is derived from the presented capability before validity
+        // checks, so probing with random capabilities creates new entries. Drop
+        // fully expired windows at most once per window so the map stays bounded
+        // by recent traffic instead of growing for the life of the process.
+        if now.duration_since(state.last_sweep) >= Self::WINDOW {
+            state.windows.retain(|_, window| {
+                while window
+                    .front()
+                    .is_some_and(|time| now.duration_since(*time) >= Self::WINDOW)
+                {
+                    window.pop_front();
+                }
+                !window.is_empty()
+            });
+            state.last_sweep = now;
+        }
+        let window = state.windows.entry(key).or_default();
         while window
             .front()
-            .is_some_and(|time| now.duration_since(*time) >= Duration::from_secs(60))
+            .is_some_and(|time| now.duration_since(*time) >= Self::WINDOW)
         {
             window.pop_front();
         }
@@ -119,6 +155,15 @@ impl DepositRateLimiter {
         }
         window.push_back(now);
         true
+    }
+
+    #[cfg(test)]
+    fn tracked_keys(&self) -> usize {
+        self.attempts
+            .lock()
+            .expect("rate limiter mutex poisoned")
+            .windows
+            .len()
     }
 }
 
@@ -989,5 +1034,23 @@ mod tests {
             assert!(limiter.allow([4_u8; 32]));
         }
         assert!(!limiter.allow([4_u8; 32]));
+    }
+
+    #[test]
+    fn limiter_evicts_expired_windows() {
+        let limiter = DepositRateLimiter::default();
+        let start = Instant::now();
+        assert!(limiter.allow_at([1_u8; 32], start));
+        assert!(limiter.allow_at([2_u8; 32], start));
+        assert_eq!(limiter.tracked_keys(), 2);
+        // A request after the window elapses sweeps the expired entries.
+        let later = start + DepositRateLimiter::WINDOW + Duration::from_secs(1);
+        assert!(limiter.allow_at([3_u8; 32], later));
+        assert_eq!(limiter.tracked_keys(), 1);
+        // A key with recent attempts survives the sweep.
+        assert!(limiter.allow_at([4_u8; 32], later + Duration::from_secs(30)));
+        let final_sweep = later + DepositRateLimiter::WINDOW + Duration::from_secs(1);
+        assert!(limiter.allow_at([5_u8; 32], final_sweep));
+        assert_eq!(limiter.tracked_keys(), 2);
     }
 }

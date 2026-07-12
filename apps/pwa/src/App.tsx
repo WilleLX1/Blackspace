@@ -27,6 +27,7 @@ import { createCompanionPairingOffer, createPrimaryPairingResponse, openPrimaryP
 import { detectTransportMode, deriveTransportMode, modeLabel, validateServerUrl } from "./security";
 import { createRecoveryKit, deleteVault, lockVault, openRecoveryKit, saveVault, unlockVault, vaultExists } from "./vault";
 import { pairingQrImage, scanQr } from "./qr";
+import { createSerialRunner } from "./serial";
 
 type Screen = "loading" | "welcome" | "locked" | "messenger";
 type Dialog = "add" | "invite" | "settings" | "security" | "link" | null;
@@ -275,37 +276,29 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   const syncing = useRef(false);
   const syncFailures = useRef(0);
   const resumedPendingRotation = useRef(false);
-  const mirrorChain = useRef<Promise<unknown>>(Promise.resolve());
   accountRef.current = account;
 
   const persist = useCallback(async (next: AccountState) => {
     accountRef.current = next; setAccount(next); await saveVault(next, passphrase);
   }, [passphrase]);
 
-  // Serialize every MLS-mutating operation (poll processing, sends, accepts) through
-  // one chain so they never interleave and fork the single ratchet. Local send paths
-  // were previously outside the poll guard — this closes that pre-existing race.
-  const mlsChain = useRef<Promise<unknown>>(Promise.resolve());
-  const runExclusive = useCallback(<T,>(task: () => Promise<T>): Promise<T> => {
-    const result = mlsChain.current.then(task, task);
-    mlsChain.current = result.then(() => undefined, () => undefined);
-    return result;
-  }, []);
+  // Serialize every clone→mutate→persist cycle (poll processing, sends, accepts,
+  // retries, mirror snapshots, one-field edits) through one runner so they never
+  // interleave. A stale clone persisted mid-poll would revert mlsClientState and
+  // fork the ratchet, or revert companionLink.downSeq and reuse an AEAD nonce.
+  // Never await queueMirrorSnapshot from inside a runExclusive task — it enqueues
+  // on the same runner, so that would deadlock. Call it after the task completes.
+  const runExclusive = useRef(createSerialRunner()).current;
 
-  const queueMirrorSnapshot = useCallback((): Promise<void> => {
-    const task = async () => {
-      let next = structuredClone(accountRef.current); if (!next.companionLink?.active) return;
-      next.companionLink.downSeq += 1; await persist(next);
-      const event: DownlinkEvent = { type: "snapshot", eventId: crypto.randomUUID(), ts: Date.now(), payload: buildSnapshot(next) };
-      const packet = await sealLinkEvent(next.companionLink.linkSecret, next.companionLink.pairingId, "down", next.companionLink.downSeq, event);
-      next = structuredClone(accountRef.current); const outbox = next.companionLink!.downlinkOutbox;
-      if (outbox.length >= 200) outbox.splice(0, outbox.length);
-      outbox.push(envelopeForPacket(packet)); await persist(next);
-    };
-    const result = mirrorChain.current.then(task, task);
-    mirrorChain.current = result.then(() => undefined, () => undefined);
-    return result;
-  }, [persist]);
+  const queueMirrorSnapshot = useCallback((): Promise<void> => runExclusive(async () => {
+    let next = structuredClone(accountRef.current); if (!next.companionLink?.active) return;
+    next.companionLink.downSeq += 1; await persist(next);
+    const event: DownlinkEvent = { type: "snapshot", eventId: crypto.randomUUID(), ts: Date.now(), payload: buildSnapshot(next) };
+    const packet = await sealLinkEvent(next.companionLink.linkSecret, next.companionLink.pairingId, "down", next.companionLink.downSeq, event);
+    next = structuredClone(accountRef.current); const outbox = next.companionLink!.downlinkOutbox;
+    if (outbox.length >= 200) outbox.splice(0, outbox.length);
+    outbox.push(envelopeForPacket(packet)); await persist(next);
+  }), [persist, runExclusive]);
 
   const ownServer = ownOrigin(account.onionOrigin, account.httpsOrigin);
   const selected = account.contacts.find((contact) => contact.id === selectedId);
@@ -352,15 +345,16 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   }, [ownServer, persist, queueMirrorSnapshot, runExclusive]);
 
   useEffect(() => {
-    const pending = accountRef.current.pendingReadCapability; if (!pending || resumedPendingRotation.current) return; resumedPendingRotation.current = true;
-    void (async () => {
-      const current = accountRef.current; const link = current.companionLink;
+    if (!accountRef.current.pendingReadCapability || resumedPendingRotation.current) return; resumedPendingRotation.current = true;
+    void runExclusive(async () => {
+      const current = accountRef.current; const pending = current.pendingReadCapability; if (!pending) return;
+      const link = current.companionLink;
       await rotateReadCapability(ownServer, current.adminCapability, await capabilityVerifier("read", pending));
       let next = structuredClone(accountRef.current); next.readCapability = pending; await persist(next);
       if (link) { await revokeDepositCapability(ownServer, next.adminCapability, link.downlinkCapId); await revokeDepositCapability(ownServer, next.adminCapability, link.uplinkCapId); }
       next = structuredClone(accountRef.current); next.pendingReadCapability = undefined; next.companionLink = undefined; await persist(next);
-    })().catch(() => undefined);
-  }, [ownServer, persist]);
+    }).catch(() => undefined);
+  }, [ownServer, persist, runExclusive]);
 
   useEffect(() => {
     const onlineHandler = () => setOnline(true); const offlineHandler = () => setOnline(false);
@@ -368,6 +362,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     return () => { window.removeEventListener("online", onlineHandler); window.removeEventListener("offline", offlineHandler); };
   }, []);
 
+  // Advances the MLS ratchet — callers must already be inside a runExclusive task.
   const sendReceipt = useCallback(async (state: AccountState, contact: ContactRecord, messageId: string) => {
     if (!contact.mlsGroupId) return;
     const content: SecureContent = { version: 1, type: "delivery_receipt", messageId: crypto.randomUUID(), sentAt: Date.now(), senderIdentity: state.identityPublicKey, deliveredIds: [messageId] };
@@ -540,7 +535,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
 
   const selectContact = async (contact: ContactRecord) => {
     setSelectedId(contact.id); setMobileList(false);
-    if (contact.unread) { const next = structuredClone(accountRef.current); const match = next.contacts.find((item) => item.id === contact.id); if (match) match.unread = 0; await persist(next); }
+    if (contact.unread) await runExclusive(async () => { const next = structuredClone(accountRef.current); const match = next.contacts.find((item) => item.id === contact.id); if (match) match.unread = 0; await persist(next); });
   };
 
   const makeInvite = async () => {
@@ -550,7 +545,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
       const advertised = advertisedOrigins(info, accountRef.current.onionOrigin);
       let current = accountRef.current;
       if (current.onionOrigin !== advertised.onionOrigin || current.httpsOrigin !== advertised.httpsOrigin) {
-        const next = structuredClone(current); next.onionOrigin = advertised.onionOrigin; next.httpsOrigin = advertised.httpsOrigin; await persist(next); current = next;
+        current = await runExclusive(async () => { const next = structuredClone(accountRef.current); next.onionOrigin = advertised.onionOrigin; next.httpsOrigin = advertised.httpsOrigin; await persist(next); return next; });
       }
       const capability = randomCapability();
       await createDepositCapability(ownServer, current.adminCapability, await capabilityVerifier("deposit", capability));
@@ -641,8 +636,8 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
           const failed = structuredClone(accountRef.current); const message = failed.messages.find((item) => item.id === messageId); if (message) { message.delivery = navigator.onLine ? "failed" : "queued"; message.error = navigator.onLine ? errorMessage(cause, "Send failed") : undefined; } await persist(failed);
         }
         setSelectedId(contact.id); setDialog(null); setMobileList(false);
-        await queueMirrorSnapshot();
       });
+      await queueMirrorSnapshot();
     } catch (cause) { setError(errorMessage(cause, "Could not add the contact.")); }
     finally { setBusy(false); }
   };
@@ -662,34 +657,39 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
       } catch (cause) {
         next = structuredClone(accountRef.current); const message = next.messages.find((item) => item.id === messageId); if (message) { message.delivery = navigator.onLine ? "failed" : "queued"; message.error = navigator.onLine ? errorMessage(cause, "Send failed") : undefined; } else { next.messages.push({ id: messageId, contactId, direction: "outgoing", body, sentAt, delivery: "failed", error: errorMessage(cause, "Encryption failed") }); } await persist(next);
       }
-      await queueMirrorSnapshot();
     });
+    await queueMirrorSnapshot();
   };
 
-  const retryMessage = async (message: MessageRecord) => {
+  const retryMessage = async (message: MessageRecord) => runExclusive(async () => {
     const contact = accountRef.current.contacts.find((item) => item.id === message.contactId);
-    if (!contact?.mlsGroupId) return;
+    // Re-read the outbox record inside the lock — the render-time prop may be
+    // stale if a poll already delivered or cleared this message.
+    const record = accountRef.current.messages.find((item) => item.id === message.id);
+    if (!contact?.mlsGroupId || !record || record.delivery !== "failed") return;
     let next = structuredClone(accountRef.current); const pending = next.messages.find((item) => item.id === message.id); if (pending) { pending.delivery = "queued"; pending.error = undefined; } await persist(next);
     try {
-      if (!message.pendingEnvelope) throw new Error("The encrypted outbox record is unavailable.");
-      await depositEnvelope(contact.target, message.pendingEnvelope);
+      if (!record.pendingEnvelope) throw new Error("The encrypted outbox record is unavailable.");
+      await depositEnvelope(contact.target, record.pendingEnvelope);
       next = structuredClone(accountRef.current); const sent = next.messages.find((item) => item.id === message.id); if (sent) { sent.delivery = "server-accepted"; sent.pendingEnvelope = undefined; } await persist(next);
     } catch (cause) {
       next = structuredClone(accountRef.current); const failed = next.messages.find((item) => item.id === message.id); if (failed) { failed.delivery = "failed"; failed.error = errorMessage(cause, "Send failed"); } await persist(next);
     }
-  };
+  });
 
   const updateDraft = (value: string) => {
     const next = structuredClone(account); const contact = next.contacts.find((item) => item.id === selectedId); if (contact) contact.draft = value; setAccount(next);
   };
 
   const blockContact = async (contactId: string) => {
-    await runExclusive(async () => {
+    const changed = await runExclusive(async () => {
       const next = structuredClone(accountRef.current); const contact = next.contacts.find((item) => item.id === contactId);
-      if (!contact) return;
+      if (!contact) return false;
       if (contact.inboundCapabilityId) await revokeDepositCapability(ownServer, next.adminCapability, contact.inboundCapabilityId);
-      contact.status = "blocked"; contact.draft = ""; await persist(next); setSelectedId(""); await queueMirrorSnapshot();
+      contact.status = "blocked"; contact.draft = ""; await persist(next); setSelectedId("");
+      return true;
     });
+    if (changed) await queueMirrorSnapshot();
   };
 
   const acceptRequest = async (accepted: boolean) => {
@@ -710,8 +710,8 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
           await depositEnvelope(contact.target, envelopeForPacket({ kind: "mls", hint: await mlsGroupHint(contact.mlsGroupId), message: encrypted.message }));
         } catch (cause) { setError(errorMessage(cause, "The contact was accepted, but your profile could not be sent.")); }
       }
-      await queueMirrorSnapshot();
     });
+    await queueMirrorSnapshot();
   };
 
   const exportRecovery = async () => {
@@ -768,7 +768,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     {dialog === "invite" && <InviteModal value={inviteValue} qr={inviteQr} onClose={() => setDialog(null)} />}
     {dialog === "settings" && <SettingsModal account={account} mode={transportMode ? modeLabel(transportMode) : "Blocked"} onExport={exportRecovery} onLink={() => setDialog("link")} onUnlink={() => void unlinkDevice().catch((cause) => setError(errorMessage(cause, "Could not unlink this device.")))} onLock={onLock} onClose={() => setDialog(null)} />}
     {dialog === "link" && <LinkDeviceModal setup={linkSetup} onPrepare={(code) => void prepareDeviceLink(code).catch((cause) => setError(errorMessage(cause, "Could not prepare device pairing.")))} onConfirm={() => void confirmDeviceLink().catch((cause) => setError(errorMessage(cause, "Could not finish device pairing.")))} onClose={() => void cancelDeviceLink()} />}
-    {dialog === "security" && selected && <SecurityModal account={account} contact={selected} onNickname={async (nickname) => { const next = structuredClone(accountRef.current); const match = next.contacts.find((item) => item.id === selected.id); if (match) match.localName = nickname.trim() || undefined; await persist(next); }} onBlock={async () => { if (confirm(`Block ${selected.localName ?? selected.displayName} and revoke their mailbox access?`)) { try { await blockContact(selected.id); setDialog(null); } catch (cause) { setError(errorMessage(cause, "Could not block this contact.")); } } }} onVerified={async () => { const next = structuredClone(account); const match = next.contacts.find((item) => item.id === selected.id); if (match) match.verified = true; await persist(next); setDialog(null); }} onClose={() => setDialog(null)} />}
+    {dialog === "security" && selected && <SecurityModal account={account} contact={selected} onNickname={async (nickname) => runExclusive(async () => { const next = structuredClone(accountRef.current); const match = next.contacts.find((item) => item.id === selected.id); if (match) match.localName = nickname.trim() || undefined; await persist(next); })} onBlock={async () => { if (confirm(`Block ${selected.localName ?? selected.displayName} and revoke their mailbox access?`)) { try { await blockContact(selected.id); setDialog(null); } catch (cause) { setError(errorMessage(cause, "Could not block this contact.")); } } }} onVerified={async () => { await runExclusive(async () => { const next = structuredClone(accountRef.current); const match = next.contacts.find((item) => item.id === selected.id); if (match) match.verified = true; await persist(next); }); setDialog(null); }} onClose={() => setDialog(null)} />}
     {error && <Notice error={error} onClose={() => setError("")} />}
   </main>;
 }
@@ -863,46 +863,48 @@ function LinkedCompanionMessenger({ initial, passphrase, onLock, onReset }: { in
   const [error, setError] = useState(""); const [unlinked, setUnlinked] = useState(false); const [now, setNow] = useState(Date.now());
   const syncing = useRef(false);
   const syncFailures = useRef(0);
-  const commandChain = useRef<Promise<unknown>>(Promise.resolve());
+  // One runner for poll and commands: upSeq is the uplink AEAD nonce, so a poll
+  // persisting a clone taken before a command bumped it would reuse a nonce.
+  const runLinked = useRef(createSerialRunner()).current;
   const persist = useCallback(async (next: CompanionAccountState) => { accountRef.current = next; setAccount(next); await saveVault(next, passphrase); }, [passphrase]);
   const ownServer = ownOrigin(account.onionOrigin, account.httpsOrigin);
 
-  const queueCommand = useCallback((command: UplinkCommand): Promise<void> => {
-    const task = async () => {
-      let next = structuredClone(accountRef.current); next.link.upSeq += 1; await persist(next);
-      const packet = await sealLinkEvent(next.link.linkSecret, next.link.pairingId, "up", next.link.upSeq, command);
-      next = structuredClone(accountRef.current); next.link.uplinkOutbox.push(envelopeForPacket(packet)); await persist(next);
-    };
-    const result = commandChain.current.then(task, task);
-    commandChain.current = result.then(() => undefined, () => undefined);
-    return result;
-  }, [persist]);
+  const queueCommand = useCallback((command: UplinkCommand): Promise<void> => runLinked(async () => {
+    let next = structuredClone(accountRef.current); next.link.upSeq += 1; await persist(next);
+    const packet = await sealLinkEvent(next.link.linkSecret, next.link.pairingId, "up", next.link.upSeq, command);
+    next = structuredClone(accountRef.current); next.link.uplinkOutbox.push(envelopeForPacket(packet)); await persist(next);
+  }), [persist, runLinked]);
 
   const poll = useCallback(async () => {
     if (syncing.current || unlinked || !navigator.onLine) return; syncing.current = true;
     try {
-      let next = structuredClone(accountRef.current);
-      const target: DepositTarget = { onion_url: next.onionOrigin, https_url: next.httpsOrigin, deposit_capability: next.link.uplinkCap };
-      const remaining: PendingEnvelope[] = [];
-      for (const [index, envelope] of next.link.uplinkOutbox.entries()) { try { await depositEnvelope(target, envelope); } catch { remaining.push(...next.link.uplinkOutbox.slice(index)); break; } }
-      next.link.uplinkOutbox = remaining; await persist(next);
-      const pulled = await pullEnvelopes(ownOrigin(next.onionOrigin, next.httpsOrigin), next.readCapability);
-      const acknowledged: string[] = []; let gap = false;
-      for (const envelope of pulled) {
-        const disposition = classify(envelope.deposit_capability_id, "companion", { downlinkCapId: next.link.downlinkCapId, uplinkCapId: next.link.uplinkCapId });
-        if (disposition.action !== "applyDownlink") continue;
-        try {
-          const packet = packetFromEnvelope(envelope.ciphertext);
-          if (packet.kind !== "link" || packet.dir !== "down" || packet.pid !== next.link.pairingId) throw new Error("Invalid companion downlink.");
-          if (packet.seq <= next.link.downLastApplied) { acknowledged.push(envelope.acknowledgement_token); continue; }
-          if (packet.seq > next.link.downLastApplied + 1) gap = true;
-          const event = await openLinkEvent<DownlinkEvent>(next.link.linkSecret, packet);
-          next = applyDownlinkEvent(next, event).state; next.link.downLastApplied = packet.seq;
-          acknowledged.push(envelope.acknowledgement_token);
-        } catch { acknowledged.push(envelope.acknowledgement_token); }
-      }
-      await persist(next);
-      if (acknowledged.length) await acknowledgeEnvelopes(ownOrigin(next.onionOrigin, next.httpsOrigin), next.readCapability, acknowledged);
+      // queueCommand shares runLinked, so the resnapshot request must be sent
+      // after this task releases the runner — awaiting it inside would deadlock.
+      const gap = await runLinked(async () => {
+        let next = structuredClone(accountRef.current);
+        const target: DepositTarget = { onion_url: next.onionOrigin, https_url: next.httpsOrigin, deposit_capability: next.link.uplinkCap };
+        const remaining: PendingEnvelope[] = [];
+        for (const [index, envelope] of next.link.uplinkOutbox.entries()) { try { await depositEnvelope(target, envelope); } catch { remaining.push(...next.link.uplinkOutbox.slice(index)); break; } }
+        next.link.uplinkOutbox = remaining; await persist(next);
+        const pulled = await pullEnvelopes(ownOrigin(next.onionOrigin, next.httpsOrigin), next.readCapability);
+        const acknowledged: string[] = []; let sawGap = false;
+        for (const envelope of pulled) {
+          const disposition = classify(envelope.deposit_capability_id, "companion", { downlinkCapId: next.link.downlinkCapId, uplinkCapId: next.link.uplinkCapId });
+          if (disposition.action !== "applyDownlink") continue;
+          try {
+            const packet = packetFromEnvelope(envelope.ciphertext);
+            if (packet.kind !== "link" || packet.dir !== "down" || packet.pid !== next.link.pairingId) throw new Error("Invalid companion downlink.");
+            if (packet.seq <= next.link.downLastApplied) { acknowledged.push(envelope.acknowledgement_token); continue; }
+            if (packet.seq > next.link.downLastApplied + 1) sawGap = true;
+            const event = await openLinkEvent<DownlinkEvent>(next.link.linkSecret, packet);
+            next = applyDownlinkEvent(next, event).state; next.link.downLastApplied = packet.seq;
+            acknowledged.push(envelope.acknowledgement_token);
+          } catch { acknowledged.push(envelope.acknowledgement_token); }
+        }
+        await persist(next);
+        if (acknowledged.length) await acknowledgeEnvelopes(ownOrigin(next.onionOrigin, next.httpsOrigin), next.readCapability, acknowledged);
+        return sawGap;
+      });
       if (gap) await queueCommand({ type: "request_resnapshot", commandId: crypto.randomUUID(), ts: Date.now(), reason: "sequence gap" });
       syncFailures.current = 0;
     } catch (cause) {
@@ -912,7 +914,7 @@ function LinkedCompanionMessenger({ initial, passphrase, onLock, onReset }: { in
       else if (message === "Tor is not ready. Blackspace will not use a direct connection.") return;
       else if (syncFailures.current >= 3) setError(message);
     } finally { syncing.current = false; }
-  }, [persist, queueCommand, unlinked]);
+  }, [persist, queueCommand, runLinked, unlinked]);
 
   useEffect(() => { void queueCommand({ type: "hello", commandId: crypto.randomUUID(), ts: Date.now(), label: navigator.userAgent.includes("Mobile") ? "Phone" : "Browser", downLastApplied: accountRef.current.link.downLastApplied }).then(poll); }, []); // pairing hello once per unlock
   useEffect(() => { void poll(); const timer = window.setInterval(() => { setNow(Date.now()); void poll(); }, 5_000); return () => clearInterval(timer); }, [poll]);
@@ -921,9 +923,12 @@ function LinkedCompanionMessenger({ initial, passphrase, onLock, onReset }: { in
   const conversations = account.contacts.filter((contact) => contact.status !== "blocked").sort((a, b) => b.lastMessageAt - a.lastMessageAt);
   const primaryOffline = Boolean(account.link.lastDownlinkAt && now - account.link.lastDownlinkAt > 20_000);
   const send = async () => {
-    if (!selected?.draft.trim()) return; const body = selected.draft.trim(); const id = crypto.randomUUID();
-    let next = structuredClone(accountRef.current); const contact = next.contacts.find((item) => item.id === selected.id)!; contact.draft = ""; next.messages.push(newMessage(contact.id, body, id)); await persist(next);
-    await queueCommand({ type: "send_text", commandId: id, ts: Date.now(), contactId: contact.id, body, clientSentAt: Date.now() }); void poll();
+    if (!selected?.draft.trim()) return; const body = selected.draft.trim(); const id = crypto.randomUUID(); const contactId = selected.id;
+    await runLinked(async () => {
+      const next = structuredClone(accountRef.current); const contact = next.contacts.find((item) => item.id === contactId); if (!contact) return;
+      contact.draft = ""; next.messages.push(newMessage(contactId, body, id)); await persist(next);
+    });
+    await queueCommand({ type: "send_text", commandId: id, ts: Date.now(), contactId, body, clientSentAt: Date.now() }); void poll();
   };
   const relay = (command: UplinkCommand) => { void queueCommand(command).then(poll); };
   return <main className="workspace">
@@ -935,7 +940,7 @@ function LinkedCompanionMessenger({ initial, passphrase, onLock, onReset }: { in
     <section className="chat-panel mobile-visible">{selected ? <><header className="chat-header"><div className="avatar">{initials(selected.displayName)}</div><div><h2>{selected.localName ?? selected.displayName}</h2><p>{selected.verified ? "Identity verified by primary" : "Relayed through your primary device"}</p></div><span className="chat-spacer" /><button className="icon-button" title="Ask primary to mark verified" disabled={unlinked || selected.verified} onClick={() => relay({ type: "set_verified", commandId: crypto.randomUUID(), ts: Date.now(), contactId: selected.id })}><Fingerprint /></button></header>
       {selected.status === "request" && <div className="request-banner"><div><strong>New message request</strong><span>Accept or block through your primary device.</span></div><button className="secondary" disabled={unlinked} onClick={() => relay({ type: "block_contact", commandId: crypto.randomUUID(), ts: Date.now(), contactId: selected.id })}>Block</button><button className="primary" disabled={unlinked} onClick={() => relay({ type: "accept_request", commandId: crypto.randomUUID(), ts: Date.now(), contactId: selected.id })}>Accept</button></div>}
       <div className="message-scroll">{messages.map((message) => <div key={message.id} className={`message-row ${message.direction}`}><div className="message-body"><div className="bubble">{message.body}</div>{message.direction === "outgoing" && <span className={`delivery ${message.delivery}`}>{message.delivery.replace("-", " ")}{message.delivery === "failed" && <button className="retry-link" onClick={() => relay({ type: "retry_message", commandId: crypto.randomUUID(), ts: Date.now(), messageId: message.id })}>Retry</button>}</span>}</div></div>)}</div>
-      <div className="composer-wrap"><div className="composer"><textarea value={selected.draft} maxLength={16_384} disabled={unlinked || selected.status === "request"} onChange={(event) => { const next = structuredClone(accountRef.current); const contact = next.contacts.find((item) => item.id === selected.id); if (contact) contact.draft = event.target.value; void persist(next); }} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={primaryOffline ? "Queue a message for your primary…" : "Message through primary"} /><button className="send-button" onClick={() => void send()} disabled={unlinked || selected.status === "request" || !selected.draft.trim()}><Send /></button></div></div></> : <div className="empty-chat"><div className="empty-orbit"><MessageCircle /></div><span className="eyebrow">LINKED DEVICE</span><h2>Companion mirror</h2><p>Choose a conversation mirrored from your primary device.</p></div>}</section>
+      <div className="composer-wrap"><div className="composer"><textarea value={selected.draft} maxLength={16_384} disabled={unlinked || selected.status === "request"} onChange={(event) => { const next = structuredClone(account); const contact = next.contacts.find((item) => item.id === selected.id); if (contact) contact.draft = event.target.value; setAccount(next); }} onBlur={() => void runLinked(async () => persist(accountRef.current))} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={primaryOffline ? "Queue a message for your primary…" : "Message through primary"} /><button className="send-button" onClick={() => void send()} disabled={unlinked || selected.status === "request" || !selected.draft.trim()}><Send /></button></div></div></> : <div className="empty-chat"><div className="empty-orbit"><MessageCircle /></div><span className="eyebrow">LINKED DEVICE</span><h2>Companion mirror</h2><p>Choose a conversation mirrored from your primary device.</p></div>}</section>
   </main>;
 }
 
