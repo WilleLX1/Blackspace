@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
+    "@zxing/library": "0.23.0",
     "hash-wasm": "^4.12.0",
     "jsqr": "1.4.0",
     "lucide-react": "^0.468.0",
