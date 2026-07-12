@@ -129,8 +129,10 @@ services:
       BLACKSPACE_HTTPS_DOMAIN: ${BLACKSPACE_HTTPS_DOMAIN:-localhost}
       BLACKSPACE_ACME_EMAIL: ${BLACKSPACE_ACME_EMAIL:-invalid@example.invalid}
     ports:
-      - "80:80"
-      - "443:443"
+      # These variables change only the host-side ports. Caddy continues to
+      # listen on its standard container ports, so 7443 means 7443 -> 443.
+      - "${BLACKSPACE_HTTP_PORT:-80}:80"
+      - "${BLACKSPACE_HTTPS_PORT:-443}:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

@@ -293,6 +293,19 @@ docker compose -f deploy/docker/compose.yaml --profile https up -d --build
 
 Caddy terminates TLS and renews certificates. HTTPS Web can deliver only to gateways explicitly included in contact invitations.
 
+`BLACKSPACE_HTTPS_DOMAIN` is a bare hostname without `https://` or a port. `BLACKSPACE_HTTPS_ORIGIN` is the exact public origin browsers use. For example:
+
+```dotenv
+BLACKSPACE_HTTPS_DOMAIN=blackspace.example.com
+BLACKSPACE_HTTPS_ORIGIN=https://blackspace.example.com:7443
+BLACKSPACE_HTTP_PORT=7080
+BLACKSPACE_HTTPS_PORT=7443
+```
+
+The host-port settings map `7080 -> 80` and `7443 -> 443` inside the Caddy container. Confirm this with `docker ps`; the HTTPS mapping must end in `->443/tcp`, not `->7443/tcp`.
+
+For automatic public certificates, the certificate authority must still be able to reach public port 80 or 443. If a router maps public `443` to the Pi's `7443`, use `BLACKSPACE_HTTPS_ORIGIN=https://blackspace.example.com` without `:7443`. If clients connect directly to public port `7443`, include `:7443` in the origin and also forward public port 80 to `BLACKSPACE_HTTP_PORT` for the ACME HTTP challenge. Otherwise, use an external TLS reverse proxy or configure a DNS challenge.
+
 ## Upgrades and reset
 
 The old v0.0.1 diagnostic mailboxes do not contain identities or key packages and are not upgradable. Reset development data before onboarding v0.1 accounts:
