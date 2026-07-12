@@ -200,6 +200,17 @@ The bundle is excluded from Git and verified against [tor-bundle.lock.json](tor-
 
 Mailbox registration is idempotent for an identical in-memory signup attempt. If Tor Browser reports that registration was interrupted, leave the invitation and display name unchanged and press **Create my private space** again. Do not reload the page first; reloading intentionally discards the client-generated capabilities.
 
+### Link a companion device
+
+The primary device remains the only MLS and identity-key holder. To link a phone or another browser:
+
+1. On the new device choose **Link to an existing account** and show its temporary QR/code.
+2. On the primary choose the linked-device button, paste or scan that code, and show the encrypted response.
+3. Open the response on the companion and compare the six-digit code shown by both devices.
+4. Confirm only when the codes match, then choose a separate local vault passphrase on the companion.
+
+The companion mirrors encrypted history and relays sends while the primary processes MLS. If the primary is offline, companion sends remain queued. Unlink from the primary to rotate mailbox read access and revoke both link deposit capabilities. A linked companion is a trusted device and can observe mailbox metadata; see [SECURITY.md](SECURITY.md#linked-companion-boundary).
+
 Each contact invitation contains a distinct write-only deposit capability and public identity. It never grants mailbox read or administration access. Secrets are URI fragments and are not sent in HTTP request paths.
 
 Messages move through `queued`, `server accepted`, `delivered`, or `failed`. The client persists the exact encrypted envelope before attempting delivery, so offline and manual retries reuse the same envelope ID. There are encrypted delivery receipts, but no read receipts or typing indicators.

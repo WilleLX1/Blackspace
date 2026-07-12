@@ -218,6 +218,7 @@ export interface components {
             version: number;
         };
         FeatureFlagsV1: {
+            companion_linking: boolean;
             key_packages: boolean;
             mls: boolean;
             opaque_transport: boolean;

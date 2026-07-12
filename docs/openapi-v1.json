@@ -543,9 +543,13 @@
           "key_packages",
           "mls",
           "registration_invites",
-          "recovery_takeover"
+          "recovery_takeover",
+          "companion_linking"
         ],
         "properties": {
+          "companion_linking": {
+            "type": "boolean"
+          },
           "key_packages": {
             "type": "boolean"
           },

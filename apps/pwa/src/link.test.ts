@@ -27,9 +27,14 @@ describe("device-sync link channel", () => {
     await expect(openLinkEvent(linkSecret, { ...packet, seq: 8 })).rejects.toBeTruthy();
   });
 
-  it("derives the nonce from the authenticated seq, ignoring a spoofed nonce field", async () => {
+  it("rejects a nonce that is not the canonical encoding of seq", async () => {
     const packet = await sealLinkEvent(linkSecret, pairingId, "down", 9, { ok: 1 });
-    expect(await openLinkEvent(linkSecret, { ...packet, nonce: randomCapability() })).toEqual({ ok: 1 });
+    await expect(openLinkEvent(linkSecret, { ...packet, nonce: randomCapability() })).rejects.toThrow();
+  });
+
+  it("rejects unsafe sequence values before nonce construction", async () => {
+    await expect(sealLinkEvent(linkSecret, pairingId, "down", 1.5, { bad: true })).rejects.toThrow();
+    await expect(sealLinkEvent(linkSecret, pairingId, "down", Number.MAX_SAFE_INTEGER + 1, { bad: true })).rejects.toThrow();
   });
 
   it("rejects a foreign linkSecret", async () => {

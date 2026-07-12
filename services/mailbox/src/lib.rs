@@ -486,8 +486,8 @@ async fn rotate_read_capability(
         "admin_capability_verifier",
     )
     .await?;
-    let verifier =
-        decode_verifier(&request.read_capability_verifier).map_err(|_| ApiError::invalid_request())?;
+    let verifier = decode_verifier(&request.read_capability_verifier)
+        .map_err(|_| ApiError::invalid_request())?;
     sqlx::query("UPDATE mailboxes SET read_capability_verifier=$1 WHERE id=$2")
         .bind(verifier.as_slice())
         .bind(mailbox_id)

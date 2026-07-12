@@ -8,7 +8,7 @@ import QRCode from "qrcode";
 import {
   acknowledgeEnvelopes, claimKeyPackage, createDepositCapability, depositEnvelope,
   ownOrigin, provisionMailbox, publishKeyPackages, pullEnvelopes, revokeDepositCapability, serverInfo,
-  recoverMailbox,
+  recoverMailbox, rotateReadCapability,
 } from "./api";
 import {
   capabilityVerifier, envelopeForPacket,
@@ -19,13 +19,17 @@ import {
 import { base64Url } from "./crypto";
 import { errorMessage } from "./errors";
 import { contactFingerprint, decodeSecureContent, encodeSecureContent, mlsCreateMessage, mlsGenerate, mlsGroupHint, mlsJoin, mlsProcessMessage, mlsRecoveryIdentitySnapshot, mlsReplenish, mlsStart } from "./mls";
-import type { AccountState, CompanionAccountState, ContactRecord, DepositTarget, KeyPackageWire, MessageRecord, StoredAccount } from "./model";
+import type { AccountState, CompanionAccountState, ContactRecord, DepositTarget, KeyPackageWire, MessageRecord, PendingEnvelope, StoredAccount } from "./model";
 import { onboardingError, type OnboardingStage } from "./onboarding";
+import { applyDownlinkEvent, buildSnapshot, newMessage, projectContact } from "./companion";
+import { classify, openLinkEvent, sealLinkEvent, type DownlinkEvent, type UplinkCommand } from "./link";
+import { createCompanionPairingOffer, createPrimaryPairingResponse, openPrimaryPairingResponse, type CompanionPairingOffer, type PairingBundle } from "./pairing";
 import { detectTransportMode, deriveTransportMode, modeLabel } from "./security";
 import { createRecoveryKit, deleteVault, lockVault, openRecoveryKit, saveVault, unlockVault, vaultExists } from "./vault";
+import { scanQr } from "./qr";
 
 type Screen = "loading" | "welcome" | "locked" | "messenger";
-type Dialog = "add" | "invite" | "settings" | "security" | null;
+type Dialog = "add" | "invite" | "settings" | "security" | "link" | null;
 
 const initials = (name: string) => name.split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("") || "?";
 const formatTime = (value: number) => new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(value);
@@ -50,13 +54,14 @@ function Notice({ error, onClose }: { error: string; onClose(): void }) {
   return <div className="toast" role="alert"><CircleAlert size={18} /><span>{error}</span><button onClick={onClose} aria-label="Dismiss"><X size={16} /></button></div>;
 }
 
-function WelcomeScreen({ onComplete }: { onComplete(state: AccountState, passphrase: string): void }) {
+function WelcomeScreen({ onComplete }: { onComplete(state: StoredAccount, passphrase: string): void }) {
   const [invitation, setInvitation] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [passphrase, setPassphrase] = useState("");
   const [confirm, setConfirm] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [linking, setLinking] = useState(false);
   const recoveryInput = useRef<HTMLInputElement>(null);
   const attempt = useRef<{
     key: string;
@@ -163,6 +168,7 @@ function WelcomeScreen({ onComplete }: { onComplete(state: AccountState, passphr
     finally { setBusy(false); if (recoveryInput.current) recoveryInput.current.value = ""; }
   };
 
+  if (linking) return <LinkCompanionScreen onComplete={onComplete} onCancel={() => setLinking(false)} />;
   return <main className="auth-shell">
     <section className="auth-brand">
       <div className="brand-mark"><MessageCircle /></div>
@@ -180,10 +186,48 @@ function WelcomeScreen({ onComplete }: { onComplete(state: AccountState, passphr
       <button className="primary wide" onClick={create} disabled={busy}>{busy ? <><RefreshCw className="spin" /> Creating encrypted identity…</> : <>Create my private space <Send size={17} /></>}</button>
       <input ref={recoveryInput} hidden type="file" accept=".blackspace-recovery,application/blackspace-recovery" onChange={(event) => void recover(event.target.files?.[0])} />
       <button className="text-button" onClick={() => recoveryInput.current?.click()} disabled={busy}><Archive size={15} /> Recover this device</button>
+      <button className="text-button" onClick={() => setLinking(true)} disabled={busy}><Users size={15} /> Link to an existing account</button>
       <p className="fine-print">Unaudited private alpha. Do not use for high-risk communications.</p>
       <ModeBadge />
     </section>
   </main>;
+}
+
+function LinkCompanionScreen({ onComplete, onCancel }: { onComplete(state: CompanionAccountState, passphrase: string): void; onCancel(): void }) {
+  const [offer, setOffer] = useState<CompanionPairingOffer>();
+  const [offerQr, setOfferQr] = useState("");
+  const [response, setResponse] = useState("");
+  const [opened, setOpened] = useState<{ bundle: PairingBundle; sas: string }>();
+  const [passphrase, setPassphrase] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const responseImage = useRef<HTMLInputElement>(null);
+  useEffect(() => { void createCompanionPairingOffer().then(async (value) => { setOffer(value); setOfferQr(await QRCode.toDataURL(value.qr, { width: 260, margin: 2 })); }).catch((cause) => setError(errorMessage(cause, "Could not start pairing."))); }, []);
+  const inspect = async () => {
+    if (!offer) return;
+    try { setOpened(await openPrimaryPairingResponse(offer, response)); setError(""); }
+    catch (cause) { setError(errorMessage(cause, "The pairing response is invalid.")); }
+  };
+  const scanResponse = async (file?: File) => {
+    if (!file) return;
+    try { setResponse(await scanQr(file)); setError(""); }
+    catch (cause) { setError(errorMessage(cause, "Could not scan the pairing response.")); }
+  };
+  const finish = async () => {
+    if (!offer || !opened) return;
+    try {
+      if (passphrase.length < 10 || passphrase !== confirm) throw new Error("Use a matching local passphrase of at least 10 characters.");
+      const value = opened.bundle;
+      const state: CompanionAccountState = {
+        version: 1, role: "companion", displayName: value.displayName, instanceName: value.instanceName,
+        mailboxId: "linked", onionOrigin: value.onionOrigin, httpsOrigin: value.httpsOrigin, createdAt: Date.now(),
+        readCapability: value.readCapability, identityPublicKey: value.identityPublicKey, contacts: [], messages: [],
+        link: { pairingId: offer.pairingId, linkSecret: value.linkSecret, downlinkCapId: value.downlinkCapId, uplinkCap: value.uplinkCap, uplinkCapId: value.uplinkCapId, downLastApplied: 0, upSeq: 0, uplinkOutbox: [], confirmed: true },
+      };
+      await saveVault(state, passphrase); onComplete(state, passphrase);
+    } catch (cause) { setError(errorMessage(cause, "Could not save this linked device.")); }
+  };
+  return <main className="lock-shell"><section className="lock-card"><span className="eyebrow">LINKED COMPANION</span><h1>Link this device</h1><p>Show this first code to your primary device. It contains only a temporary public key.</p>{offerQr && <img src={offerQr} alt="Companion pairing offer" />}<textarea readOnly rows={4} value={offer?.qr ?? "Preparing…"} />{!opened ? <><label>Response from primary<textarea rows={5} value={response} onChange={(event) => setResponse(event.target.value)} /></label><input ref={responseImage} hidden type="file" accept="image/*" capture="environment" onChange={(event) => void scanResponse(event.target.files?.[0])} /><button className="secondary wide" onClick={() => responseImage.current?.click()}><Hash size={16} /> Scan response QR</button><button className="primary wide" onClick={inspect} disabled={!response.trim()}>Open response</button></> : <><p>Compare this code on both devices before confirming:</p><code>{opened.sas}</code><label>Local vault passphrase<input type="password" value={passphrase} onChange={(event) => setPassphrase(event.target.value)} /></label><label>Confirm passphrase<input type="password" value={confirm} onChange={(event) => setConfirm(event.target.value)} /></label><button className="primary wide" onClick={finish}>Codes match — link device</button></>}{error && <p className="form-error"><CircleAlert size={16} />{error}</p>}<button className="text-button" onClick={onCancel}>Cancel</button></section></main>;
 }
 
 function LockedScreen({ onUnlock, onReset }: { onUnlock(state: StoredAccount, passphrase: string): void; onReset(): void }) {
@@ -222,7 +266,10 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   const [inviteValue, setInviteValue] = useState("");
   const [inviteQr, setInviteQr] = useState("");
   const [busy, setBusy] = useState(false);
+  const [linkSetup, setLinkSetup] = useState<{ pairingId: string; qr: string; qrImage: string; sas: string; linkSecret: string; downlinkCap: string; downlinkCapId: string; uplinkCapId: string }>();
   const syncing = useRef(false);
+  const resumedPendingRotation = useRef(false);
+  const mirrorChain = useRef<Promise<unknown>>(Promise.resolve());
   accountRef.current = account;
 
   const persist = useCallback(async (next: AccountState) => {
@@ -239,12 +286,38 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     return result;
   }, []);
 
+  const queueMirrorSnapshot = useCallback((): Promise<void> => {
+    const task = async () => {
+      let next = structuredClone(accountRef.current); if (!next.companionLink?.active) return;
+      next.companionLink.downSeq += 1; await persist(next);
+      const event: DownlinkEvent = { type: "snapshot", eventId: crypto.randomUUID(), ts: Date.now(), payload: buildSnapshot(next) };
+      const packet = await sealLinkEvent(next.companionLink.linkSecret, next.companionLink.pairingId, "down", next.companionLink.downSeq, event);
+      next = structuredClone(accountRef.current); const outbox = next.companionLink!.downlinkOutbox;
+      if (outbox.length >= 200) outbox.splice(0, outbox.length);
+      outbox.push(envelopeForPacket(packet)); await persist(next);
+    };
+    const result = mirrorChain.current.then(task, task);
+    mirrorChain.current = result.then(() => undefined, () => undefined);
+    return result;
+  }, [persist]);
+
   const ownServer = ownOrigin(account.onionOrigin, account.httpsOrigin);
   const selected = account.contacts.find((contact) => contact.id === selectedId);
   const messages = account.messages.filter((message) => message.contactId === selectedId).sort((a, b) => a.sentAt - b.sentAt);
   const filtered = account.contacts.filter((contact) => contact.status !== "blocked" && (contact.localName ?? contact.displayName).toLowerCase().includes(search.toLowerCase()));
   const requests = filtered.filter((contact) => contact.status === "request");
   const conversations = filtered.filter((contact) => contact.status !== "request");
+
+  useEffect(() => {
+    const pending = accountRef.current.pendingReadCapability; if (!pending || resumedPendingRotation.current) return; resumedPendingRotation.current = true;
+    void (async () => {
+      const current = accountRef.current; const link = current.companionLink;
+      await rotateReadCapability(ownServer, current.adminCapability, await capabilityVerifier("read", pending));
+      let next = structuredClone(accountRef.current); next.readCapability = pending; await persist(next);
+      if (link) { await revokeDepositCapability(ownServer, next.adminCapability, link.downlinkCapId); await revokeDepositCapability(ownServer, next.adminCapability, link.uplinkCapId); }
+      next = structuredClone(accountRef.current); next.pendingReadCapability = undefined; next.companionLink = undefined; await persist(next);
+    })().catch(() => undefined);
+  }, [ownServer, persist]);
 
   useEffect(() => {
     const onlineHandler = () => setOnline(true); const offlineHandler = () => setOnline(false);
@@ -267,6 +340,16 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     try {
       await runExclusive(async () => {
       let current = structuredClone(accountRef.current);
+      if (current.companionLink?.active && current.companionLink.downlinkOutbox.length) {
+        const target: DepositTarget = { onion_url: current.onionOrigin, https_url: current.httpsOrigin, deposit_capability: current.companionLink.downlinkCap };
+        const remaining: PendingEnvelope[] = [];
+        for (const [index, envelope] of current.companionLink.downlinkOutbox.entries()) {
+          try { await depositEnvelope(target, envelope); }
+          catch { remaining.push(...current.companionLink.downlinkOutbox.slice(index)); break; }
+        }
+        current.companionLink.downlinkOutbox = remaining;
+        await persist(current);
+      }
       let outboxChanged = false;
       for (const message of current.messages.filter((item) => item.direction === "outgoing" && item.delivery === "queued" && item.pendingEnvelope)) {
         const contact = current.contacts.find((item) => item.id === message.contactId);
@@ -285,10 +368,40 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
       let next = structuredClone(current);
       const acknowledged: string[] = [];
       const receipts: Array<{ contactId: string; messageId: string }> = [];
+      let mirrorChanged = false;
+      const pruneDownlinks = Boolean(next.companionLink?.active && pulled.filter((envelope) => envelope.deposit_capability_id === next.companionLink?.downlinkCapId).length >= 80);
       for (const envelope of pulled) {
+        const disposition = classify(envelope.deposit_capability_id, "primary", next.companionLink);
+        if (disposition.action === "skip") { if (pruneDownlinks) { acknowledged.push(envelope.acknowledgement_token); mirrorChanged = true; } continue; }
         try {
           const packet = packetFromEnvelope(envelope.ciphertext);
-          if (packet.kind === "mls_bootstrap") {
+          if (disposition.action === "applyUplink") {
+            if (!next.companionLink?.active || packet.kind !== "link" || packet.dir !== "up" || packet.pid !== next.companionLink.pairingId) throw new Error("Invalid companion uplink.");
+            if (packet.seq <= next.companionLink.upLastApplied) { acknowledged.push(envelope.acknowledgement_token); continue; }
+            const command = await openLinkEvent<UplinkCommand>(next.companionLink.linkSecret, packet);
+            next.companionLink.upLastApplied = packet.seq; next.companionLink.lastUplinkAt = Date.now(); mirrorChanged = true;
+            if (command.type === "hello") { next.companionLink.confirmedAt = Date.now(); next.companionLink.label = command.label; }
+            else if (command.type === "send_text" && !next.messages.some((message) => message.id === command.commandId)) {
+              const contact = next.contacts.find((item) => item.id === command.contactId);
+              if (!contact?.mlsGroupId) throw new Error("Companion selected an unavailable conversation.");
+              const content: SecureContent = { version: 1, type: "text", messageId: command.commandId, sentAt: command.clientSentAt, senderIdentity: next.identityPublicKey, body: command.body.slice(0, 16_384) };
+              const encrypted = await mlsCreateMessage(next.mlsClientState, contact.mlsGroupId, await encodeSecureContent(content));
+              const pendingEnvelope = envelopeForPacket({ kind: "mls", hint: await mlsGroupHint(contact.mlsGroupId), message: encrypted.message });
+              next.mlsClientState = encrypted.client_state; next.messages.push({ id: command.commandId, contactId: contact.id, direction: "outgoing", body: content.body!, sentAt: content.sentAt, delivery: "queued", pendingEnvelope });
+              try { await depositEnvelope(contact.target, pendingEnvelope); const sent = next.messages.find((item) => item.id === command.commandId)!; sent.delivery = "server-accepted"; sent.pendingEnvelope = undefined; }
+              catch (cause) { const failed = next.messages.find((item) => item.id === command.commandId)!; failed.delivery = "failed"; failed.error = errorMessage(cause, "Relay failed"); }
+            } else if (command.type === "retry_message") {
+              const message = next.messages.find((item) => item.id === command.messageId && item.direction === "outgoing");
+              const contact = message && next.contacts.find((item) => item.id === message.contactId);
+              if (!message?.pendingEnvelope || !contact) throw new Error("The encrypted relay record is unavailable.");
+              try { await depositEnvelope(contact.target, message.pendingEnvelope); message.delivery = "server-accepted"; message.pendingEnvelope = undefined; message.error = undefined; }
+              catch (cause) { message.delivery = "failed"; message.error = errorMessage(cause, "Relay retry failed"); }
+            } else if (command.type === "accept_request") { const contact = next.contacts.find((item) => item.id === command.contactId); if (contact) contact.status = "accepted"; }
+            else if (command.type === "block_contact") { const contact = next.contacts.find((item) => item.id === command.contactId); if (contact) { contact.status = "blocked"; if (contact.inboundCapabilityId) await revokeDepositCapability(ownServer, next.adminCapability, contact.inboundCapabilityId); } }
+            else if (command.type === "set_verified") { const contact = next.contacts.find((item) => item.id === command.contactId); if (contact) contact.verified = true; }
+            else if (command.type === "set_nickname") { const contact = next.contacts.find((item) => item.id === command.contactId); if (contact) contact.localName = command.name.slice(0, 64) || undefined; }
+            else if (command.type === "mark_read") { const contact = next.contacts.find((item) => item.id === command.contactId); if (contact) contact.unread = 0; }
+          } else if (packet.kind === "mls_bootstrap") {
             const opened = await mlsJoin(next.mlsClientState, packet.welcome, packet.firstMessage);
             const content = await decodeSecureContent(opened.first_payload);
             if (content.senderIdentity !== opened.peer_identity || !content.replyInvitation) throw new Error("The MLS credential does not match the profile card.");
@@ -324,6 +437,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
               next.messages.push({ id: content.messageId, contactId: contact.id, direction: "incoming", body: content.body, sentAt: content.sentAt, delivery: "delivered" });
               contact.lastMessageAt = content.sentAt; if (contact.id !== selectedId) contact.unread += 1;
               receipts.push({ contactId: contact.id, messageId: content.messageId });
+              mirrorChanged = true;
             } else if (content.type === "delivery_receipt") {
               for (const id of content.deliveredIds ?? []) { const message = next.messages.find((item) => item.id === id); if (message) message.delivery = "delivered"; }
             } else if (content.type === "profile" && content.displayName) {
@@ -344,6 +458,16 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
         next.mlsClientState = generated.client_state;
         await publishKeyPackages(ownOrigin(next.onionOrigin, next.httpsOrigin), next.adminCapability, wirePackages(generated.key_packages, next.identityPublicKey));
         next.availableKeyPackages = 20;
+      }
+      if (next.companionLink?.active && (mirrorChanged || acknowledged.length)) {
+        next.companionLink.downSeq += 1;
+        await persist(next);
+        const event: DownlinkEvent = { type: "snapshot", eventId: crypto.randomUUID(), ts: Date.now(), payload: buildSnapshot(next) };
+        const packet = await sealLinkEvent(next.companionLink.linkSecret, next.companionLink.pairingId, "down", next.companionLink.downSeq, event);
+        next = structuredClone(accountRef.current);
+        const outbox = next.companionLink!.downlinkOutbox;
+        if (outbox.length >= 200) outbox.splice(0, outbox.length);
+        outbox.push(envelopeForPacket(packet));
       }
       if (acknowledged.length) {
         await persist(next);
@@ -376,6 +500,60 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     finally { setBusy(false); }
   };
 
+  const prepareDeviceLink = async (offerCode: string) => {
+    if (accountRef.current.companionLink?.active) throw new Error("Unlink the existing companion before linking another.");
+    const base = accountRef.current;
+    const linkSecret = randomCapability(); const downlinkCap = randomCapability(); const uplinkCap = randomCapability();
+    let downlinkCapId = ""; let uplinkCapId = "";
+    try {
+      downlinkCapId = (await createDepositCapability(ownServer, base.adminCapability, await capabilityVerifier("deposit", downlinkCap))).capability_id;
+      uplinkCapId = (await createDepositCapability(ownServer, base.adminCapability, await capabilityVerifier("deposit", uplinkCap))).capability_id;
+      const bundle: PairingBundle = { readCapability: base.readCapability, downlinkCap, downlinkCapId, uplinkCap, uplinkCapId, linkSecret, onionOrigin: base.onionOrigin, httpsOrigin: base.httpsOrigin, identityPublicKey: base.identityPublicKey, displayName: base.displayName, instanceName: base.instanceName };
+      const response = await createPrimaryPairingResponse(offerCode, bundle);
+      setLinkSetup({ pairingId: response.pairingId, qr: response.qr, qrImage: await QRCode.toDataURL(response.qr, { width: 260, margin: 2 }), sas: response.sas, linkSecret, downlinkCap, downlinkCapId, uplinkCapId });
+    } catch (cause) {
+      if (downlinkCapId) await revokeDepositCapability(ownServer, base.adminCapability, downlinkCapId).catch(() => undefined);
+      if (uplinkCapId) await revokeDepositCapability(ownServer, base.adminCapability, uplinkCapId).catch(() => undefined);
+      throw cause;
+    }
+  };
+
+  const confirmDeviceLink = async () => {
+    if (!linkSetup) return;
+    await runExclusive(async () => {
+      let next = structuredClone(accountRef.current);
+      next.companionLink = { pairingId: linkSetup.pairingId, active: true, createdAt: Date.now(), linkSecret: linkSetup.linkSecret, downlinkCap: linkSetup.downlinkCap, downlinkCapId: linkSetup.downlinkCapId, uplinkCapId: linkSetup.uplinkCapId, downSeq: 1, upLastApplied: 0, downlinkOutbox: [] };
+      // Persist the sequence before using it as an AEAD nonce.
+      await persist(next);
+      const event: DownlinkEvent = { type: "snapshot", eventId: crypto.randomUUID(), ts: Date.now(), payload: buildSnapshot(next) };
+      const packet = await sealLinkEvent(next.companionLink.linkSecret, next.companionLink.pairingId, "down", next.companionLink.downSeq, event);
+      next = structuredClone(accountRef.current); next.companionLink!.downlinkOutbox.push(envelopeForPacket(packet)); await persist(next);
+    });
+    setLinkSetup(undefined); setDialog("settings");
+  };
+
+  const cancelDeviceLink = async () => {
+    if (linkSetup) {
+      await revokeDepositCapability(ownServer, accountRef.current.adminCapability, linkSetup.downlinkCapId).catch(() => undefined);
+      await revokeDepositCapability(ownServer, accountRef.current.adminCapability, linkSetup.uplinkCapId).catch(() => undefined);
+    }
+    setLinkSetup(undefined); setDialog(null);
+  };
+
+  const unlinkDevice = async () => {
+    await runExclusive(async () => {
+      const base = accountRef.current; const link = base.companionLink; if (!link) return;
+      const readCapability = randomCapability();
+      let next = structuredClone(base); next.pendingReadCapability = readCapability; await persist(next);
+      await rotateReadCapability(ownServer, base.adminCapability, await capabilityVerifier("read", readCapability));
+      next = structuredClone(accountRef.current); next.readCapability = readCapability; await persist(next);
+      await revokeDepositCapability(ownServer, next.adminCapability, link.downlinkCapId);
+      await revokeDepositCapability(ownServer, next.adminCapability, link.uplinkCapId);
+      next = structuredClone(accountRef.current); next.pendingReadCapability = undefined; next.companionLink = undefined; await persist(next);
+    });
+    setDialog(null);
+  };
+
   const addContact = async (value: string, firstMessage: string) => {
     setBusy(true); setError("");
     try {
@@ -403,6 +581,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
           const failed = structuredClone(accountRef.current); const message = failed.messages.find((item) => item.id === messageId); if (message) { message.delivery = navigator.onLine ? "failed" : "queued"; message.error = navigator.onLine ? errorMessage(cause, "Send failed") : undefined; } await persist(failed);
         }
         setSelectedId(contact.id); setDialog(null); setMobileList(false);
+        await queueMirrorSnapshot();
       });
     } catch (cause) { setError(errorMessage(cause, "Could not add the contact.")); }
     finally { setBusy(false); }
@@ -423,6 +602,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
       } catch (cause) {
         next = structuredClone(accountRef.current); const message = next.messages.find((item) => item.id === messageId); if (message) { message.delivery = navigator.onLine ? "failed" : "queued"; message.error = navigator.onLine ? errorMessage(cause, "Send failed") : undefined; } else { next.messages.push({ id: messageId, contactId, direction: "outgoing", body, sentAt, delivery: "failed", error: errorMessage(cause, "Encryption failed") }); } await persist(next);
       }
+      await queueMirrorSnapshot();
     });
   };
 
@@ -444,10 +624,12 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   };
 
   const blockContact = async (contactId: string) => {
-    const next = structuredClone(accountRef.current); const contact = next.contacts.find((item) => item.id === contactId);
-    if (!contact) return;
-    if (contact.inboundCapabilityId) await revokeDepositCapability(ownServer, next.adminCapability, contact.inboundCapabilityId);
-    contact.status = "blocked"; contact.draft = ""; await persist(next); setSelectedId("");
+    await runExclusive(async () => {
+      const next = structuredClone(accountRef.current); const contact = next.contacts.find((item) => item.id === contactId);
+      if (!contact) return;
+      if (contact.inboundCapabilityId) await revokeDepositCapability(ownServer, next.adminCapability, contact.inboundCapabilityId);
+      contact.status = "blocked"; contact.draft = ""; await persist(next); setSelectedId(""); await queueMirrorSnapshot();
+    });
   };
 
   const acceptRequest = async (accepted: boolean) => {
@@ -468,6 +650,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
           await depositEnvelope(contact.target, envelopeForPacket({ kind: "mls", hint: await mlsGroupHint(contact.mlsGroupId), message: encrypted.message }));
         } catch (cause) { setError(errorMessage(cause, "The contact was accepted, but your profile could not be sent.")); }
       }
+      await queueMirrorSnapshot();
     });
   };
 
@@ -497,6 +680,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     {!online && <div className="offline-banner"><CircleAlert size={14} /> Offline — messages remain queued until Blackspace reconnects.</div>}
     <aside className="server-rail">
       <button className="server-tile active" aria-label="Blackspace home"><MessageCircle /></button>
+      <button className="server-tile" aria-label={account.companionLink?.active ? "Unlink companion" : "Link companion"} onClick={() => account.companionLink?.active ? void unlinkDevice().catch((cause) => setError(errorMessage(cause, "Could not unlink this device."))) : setDialog("link")}><Users /></button>
       <span className="rail-spacer" /><button className="avatar small" onClick={() => setDialog("settings")}>{initials(account.displayName)}</button>
     </aside>
     <aside className={`conversation-sidebar ${mobileList ? "mobile-visible" : ""}`}>
@@ -522,7 +706,8 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     </section>
     {dialog === "add" && <AddContactModal busy={busy} onAdd={addContact} onClose={() => setDialog(null)} />}
     {dialog === "invite" && <InviteModal value={inviteValue} qr={inviteQr} onClose={() => setDialog(null)} />}
-    {dialog === "settings" && <SettingsModal account={account} mode={transportMode ? modeLabel(transportMode) : "Blocked"} onExport={exportRecovery} onLock={onLock} onClose={() => setDialog(null)} />}
+    {dialog === "settings" && <SettingsModal account={account} mode={transportMode ? modeLabel(transportMode) : "Blocked"} onExport={exportRecovery} onLink={() => setDialog("link")} onUnlink={() => void unlinkDevice().catch((cause) => setError(errorMessage(cause, "Could not unlink this device.")))} onLock={onLock} onClose={() => setDialog(null)} />}
+    {dialog === "link" && <LinkDeviceModal setup={linkSetup} onPrepare={(code) => void prepareDeviceLink(code).catch((cause) => setError(errorMessage(cause, "Could not prepare device pairing.")))} onConfirm={() => void confirmDeviceLink().catch((cause) => setError(errorMessage(cause, "Could not finish device pairing.")))} onClose={() => void cancelDeviceLink()} />}
     {dialog === "security" && selected && <SecurityModal account={account} contact={selected} onNickname={async (nickname) => { const next = structuredClone(accountRef.current); const match = next.contacts.find((item) => item.id === selected.id); if (match) match.localName = nickname.trim() || undefined; await persist(next); }} onBlock={async () => { if (confirm(`Block ${selected.localName ?? selected.displayName} and revoke their mailbox access?`)) { try { await blockContact(selected.id); setDialog(null); } catch (cause) { setError(errorMessage(cause, "Could not block this contact.")); } } }} onVerified={async () => { const next = structuredClone(account); const match = next.contacts.find((item) => item.id === selected.id); if (match) match.verified = true; await persist(next); setDialog(null); }} onClose={() => setDialog(null)} />}
     {error && <Notice error={error} onClose={() => setError("")} />}
   </main>;
@@ -549,11 +734,7 @@ function AddContactModal({ busy, onAdd, onClose }: { busy: boolean; onAdd(value:
   const imageInput = useRef<HTMLInputElement>(null);
   const scan = async (file?: File) => {
     if (!file) return;
-    const Detector = (window as unknown as { BarcodeDetector?: new(options: { formats: string[] }) => { detect(source: ImageBitmap): Promise<Array<{ rawValue: string }>> } }).BarcodeDetector;
-    if (!Detector) { alert("QR scanning is not available in this browser. Paste the invitation instead."); return; }
-    const bitmap = await createImageBitmap(file); const results = await new Detector({ formats: ["qr_code"] }).detect(bitmap); bitmap.close();
-    if (!results[0]?.rawValue) { alert("No Blackspace QR code was found in that image."); return; }
-    setValue(results[0].rawValue);
+    try { setValue(await scanQr(file)); } catch (cause) { alert(errorMessage(cause, "Could not scan this QR code.")); }
   };
   return <Modal title="Add a contact" onClose={onClose}><div className="modal-content"><div className="modal-icon"><UserPlus /></div><p>Paste the invitation shared directly by your contact. Blackspace verifies their signed key package before sending.</p><label>Contact invitation<textarea rows={5} value={value} onChange={(event) => setValue(event.target.value)} placeholder="blackspace://contact/v1?onion=…#cap=…" spellCheck={false} /></label><input ref={imageInput} hidden type="file" accept="image/*" capture="environment" onChange={(event) => void scan(event.target.files?.[0])} /><button className="secondary wide" onClick={() => imageInput.current?.click()}><Hash size={16} /> Scan invitation QR</button><label>First message<textarea rows={3} value={first} maxLength={16_384} onChange={(event) => setFirst(event.target.value)} placeholder="Hello…" /></label><div className="modal-actions"><button className="secondary" onClick={onClose}>Cancel</button><button className="primary" onClick={() => onAdd(value, first)} disabled={busy || !value.trim()}>{busy ? "Establishing session…" : "Add and send"}</button></div></div></Modal>;
 }
@@ -563,8 +744,20 @@ function InviteModal({ value, qr, onClose }: { value: string; qr: string; onClos
   return <Modal title="Your contact invitation" onClose={onClose}><div className="invite-modal"><p>Share this invitation with one person through a trusted channel. It grants write-only access to your mailbox.</p>{qr && <img src={qr} alt="Blackspace contact invitation QR code" />}<textarea readOnly value={value} rows={5} /><button className="primary wide" onClick={async () => { await navigator.clipboard.writeText(value); setCopied(true); }}>{copied ? <><Check /> Copied</> : <><Copy /> Copy invitation</>}</button><small>Revoke this invitation if it is exposed or abused.</small></div></Modal>;
 }
 
-function SettingsModal({ account, mode, onExport, onLock, onClose }: { account: AccountState; mode: string; onExport(): void; onLock(): void; onClose(): void }) {
-  return <Modal title="Settings" onClose={onClose}><div className="settings-profile"><span className="avatar large">{initials(account.displayName)}</span><div><h3>{account.displayName}</h3><p>{account.instanceName}</p></div></div><div className="settings-list"><div><Server /><span><strong>Transport</strong><small>{mode}</small></span></div><div><KeyRound /><span><strong>Identity</strong><small>{account.identityPublicKey.slice(0, 18)}…</small></span></div><div><Archive /><span><strong>Local vault</strong><small>Encrypted browser storage</small></span></div></div><div className="modal-actions stack"><button className="secondary wide" onClick={onExport}><Download /> Export encrypted recovery kit</button><button className="secondary wide" onClick={onLock}><LogOut /> Lock Blackspace</button></div><p className="alpha-warning"><CircleAlert /> Private alpha: browser storage cannot guarantee physical erasure of old encrypted pages.</p></Modal>;
+function SettingsModal({ account, mode, onExport, onLink, onUnlink, onLock, onClose }: { account: AccountState; mode: string; onExport(): void; onLink(): void; onUnlink(): void; onLock(): void; onClose(): void }) {
+  return <Modal title="Settings" onClose={onClose}><div className="settings-profile"><span className="avatar large">{initials(account.displayName)}</span><div><h3>{account.displayName}</h3><p>{account.instanceName}</p></div></div><div className="settings-list"><div><Server /><span><strong>Transport</strong><small>{mode}</small></span></div><div><KeyRound /><span><strong>Identity</strong><small>{account.identityPublicKey.slice(0, 18)}…</small></span></div><div><Archive /><span><strong>Local vault</strong><small>Encrypted browser storage</small></span></div></div><div className="modal-actions stack">{account.companionLink?.active ? <button className="secondary wide danger-action" onClick={onUnlink}><Users /> Unlink companion</button> : <button className="secondary wide" onClick={onLink}><Users /> Link a companion</button>}<button className="secondary wide" onClick={onExport}><Download /> Export encrypted recovery kit</button><button className="secondary wide" onClick={onLock}><LogOut /> Lock Blackspace</button></div><p className="alpha-warning"><CircleAlert /> Private alpha: browser storage cannot guarantee physical erasure of old encrypted pages.</p></Modal>;
+}
+
+function LinkDeviceModal({ setup, onPrepare, onConfirm, onClose }: { setup?: { qr: string; qrImage: string; sas: string }; onPrepare(code: string): void; onConfirm(): void; onClose(): void }) {
+  const [offer, setOffer] = useState("");
+  const offerImage = useRef<HTMLInputElement>(null);
+  const [scanError, setScanError] = useState("");
+  const scanOffer = async (file?: File) => {
+    if (!file) return;
+    try { setOffer(await scanQr(file)); setScanError(""); }
+    catch (cause) { setScanError(errorMessage(cause, "Could not scan the companion offer.")); }
+  };
+  return <Modal title="Link a companion" onClose={onClose}><div className="modal-content">{!setup ? <><p>Paste or scan the temporary code shown by the companion. It contains no reusable account secret.</p><label>Companion offer<textarea rows={5} value={offer} onChange={(event) => setOffer(event.target.value)} /></label><input ref={offerImage} hidden type="file" accept="image/*" capture="environment" onChange={(event) => void scanOffer(event.target.files?.[0])} /><button className="secondary wide" onClick={() => offerImage.current?.click()}><Hash size={16} /> Scan companion QR</button>{scanError && <p className="form-error"><CircleAlert size={16} />{scanError}</p>}<button className="primary wide" onClick={() => onPrepare(offer)} disabled={!offer.trim()}>Create encrypted response</button></> : <><p>Show this response to the companion, then compare the six-digit code on both devices.</p><img src={setup.qrImage} alt="Encrypted primary pairing response" /><textarea readOnly rows={5} value={setup.qr} /><code>{setup.sas}</code><button className="primary wide" onClick={onConfirm}>Codes match — finish linking</button></>}<button className="secondary wide" onClick={onClose}>Cancel</button></div></Modal>;
 }
 
 function SecurityModal({ account, contact, onNickname, onBlock, onVerified, onClose }: { account: AccountState; contact: ContactRecord; onNickname(value: string): void; onBlock(): void; onVerified(): void; onClose(): void }) {
@@ -604,6 +797,83 @@ function CompanionMessenger({ initial, onLock }: { initial: CompanionAccountStat
   </main>;
 }
 
+function LinkedCompanionMessenger({ initial, passphrase, onLock, onReset }: { initial: CompanionAccountState; passphrase: string; onLock(): void; onReset(): void }) {
+  const [account, setAccount] = useState(initial); const accountRef = useRef(account); accountRef.current = account;
+  const [selectedId, setSelectedId] = useState(initial.contacts.find((contact) => contact.status === "accepted")?.id ?? "");
+  const [error, setError] = useState(""); const [unlinked, setUnlinked] = useState(false); const [now, setNow] = useState(Date.now());
+  const syncing = useRef(false);
+  const commandChain = useRef<Promise<unknown>>(Promise.resolve());
+  const persist = useCallback(async (next: CompanionAccountState) => { accountRef.current = next; setAccount(next); await saveVault(next, passphrase); }, [passphrase]);
+  const ownServer = ownOrigin(account.onionOrigin, account.httpsOrigin);
+
+  const queueCommand = useCallback((command: UplinkCommand): Promise<void> => {
+    const task = async () => {
+      let next = structuredClone(accountRef.current); next.link.upSeq += 1; await persist(next);
+      const packet = await sealLinkEvent(next.link.linkSecret, next.link.pairingId, "up", next.link.upSeq, command);
+      next = structuredClone(accountRef.current); next.link.uplinkOutbox.push(envelopeForPacket(packet)); await persist(next);
+    };
+    const result = commandChain.current.then(task, task);
+    commandChain.current = result.then(() => undefined, () => undefined);
+    return result;
+  }, [persist]);
+
+  const poll = useCallback(async () => {
+    if (syncing.current || unlinked || !navigator.onLine) return; syncing.current = true;
+    try {
+      let next = structuredClone(accountRef.current);
+      const target: DepositTarget = { onion_url: next.onionOrigin, https_url: next.httpsOrigin, deposit_capability: next.link.uplinkCap };
+      const remaining: PendingEnvelope[] = [];
+      for (const [index, envelope] of next.link.uplinkOutbox.entries()) { try { await depositEnvelope(target, envelope); } catch { remaining.push(...next.link.uplinkOutbox.slice(index)); break; } }
+      next.link.uplinkOutbox = remaining; await persist(next);
+      const pulled = await pullEnvelopes(ownOrigin(next.onionOrigin, next.httpsOrigin), next.readCapability);
+      const acknowledged: string[] = []; let gap = false;
+      for (const envelope of pulled) {
+        const disposition = classify(envelope.deposit_capability_id, "companion", { downlinkCapId: next.link.downlinkCapId, uplinkCapId: next.link.uplinkCapId });
+        if (disposition.action !== "applyDownlink") continue;
+        try {
+          const packet = packetFromEnvelope(envelope.ciphertext);
+          if (packet.kind !== "link" || packet.dir !== "down" || packet.pid !== next.link.pairingId) throw new Error("Invalid companion downlink.");
+          if (packet.seq <= next.link.downLastApplied) { acknowledged.push(envelope.acknowledgement_token); continue; }
+          if (packet.seq > next.link.downLastApplied + 1) gap = true;
+          const event = await openLinkEvent<DownlinkEvent>(next.link.linkSecret, packet);
+          next = applyDownlinkEvent(next, event).state; next.link.downLastApplied = packet.seq;
+          acknowledged.push(envelope.acknowledgement_token);
+        } catch { acknowledged.push(envelope.acknowledgement_token); }
+      }
+      await persist(next);
+      if (acknowledged.length) await acknowledgeEnvelopes(ownOrigin(next.onionOrigin, next.httpsOrigin), next.readCapability, acknowledged);
+      if (gap) await queueCommand({ type: "request_resnapshot", commandId: crypto.randomUUID(), ts: Date.now(), reason: "sequence gap" });
+    } catch (cause) {
+      const message = errorMessage(cause, "Companion sync failed.");
+      if (/401|authorization failed/i.test(message)) setUnlinked(true); else setError(message);
+    } finally { syncing.current = false; }
+  }, [persist, queueCommand, unlinked]);
+
+  useEffect(() => { void queueCommand({ type: "hello", commandId: crypto.randomUUID(), ts: Date.now(), label: navigator.userAgent.includes("Mobile") ? "Phone" : "Browser", downLastApplied: accountRef.current.link.downLastApplied }).then(poll); }, []); // pairing hello once per unlock
+  useEffect(() => { void poll(); const timer = window.setInterval(() => { setNow(Date.now()); void poll(); }, 5_000); return () => clearInterval(timer); }, [poll]);
+
+  const selected = account.contacts.find((contact) => contact.id === selectedId); const messages = account.messages.filter((message) => message.contactId === selectedId).sort((a, b) => a.sentAt - b.sentAt);
+  const conversations = account.contacts.filter((contact) => contact.status !== "blocked").sort((a, b) => b.lastMessageAt - a.lastMessageAt);
+  const primaryOffline = Boolean(account.link.lastDownlinkAt && now - account.link.lastDownlinkAt > 20_000);
+  const send = async () => {
+    if (!selected?.draft.trim()) return; const body = selected.draft.trim(); const id = crypto.randomUUID();
+    let next = structuredClone(accountRef.current); const contact = next.contacts.find((item) => item.id === selected.id)!; contact.draft = ""; next.messages.push(newMessage(contact.id, body, id)); await persist(next);
+    await queueCommand({ type: "send_text", commandId: id, ts: Date.now(), contactId: contact.id, body, clientSentAt: Date.now() }); void poll();
+  };
+  const relay = (command: UplinkCommand) => { void queueCommand(command).then(poll); };
+  return <main className="workspace">
+    {unlinked && <div className="offline-banner"><CircleAlert /> This device was unlinked. <button className="retry-link" onClick={onReset}>Wipe local mirror</button></div>}
+    {primaryOffline && !unlinked && <div className="offline-banner"><CircleAlert /> Primary offline — sends remain queued.</div>}
+    {error && <Notice error={error} onClose={() => setError("")} />}
+    <aside className="server-rail"><button className="server-tile active"><MessageCircle /></button><span className="rail-spacer" /><button className="avatar small" onClick={onLock}><LogOut /></button></aside>
+    <aside className="conversation-sidebar mobile-visible"><header className="workspace-header"><div><span className="eyebrow">LINKED DEVICE</span><h1>{account.instanceName}</h1></div></header><section className="contact-section"><h3>Direct messages<span>{conversations.length}</span></h3>{conversations.map((contact) => <button key={contact.id} className={`contact-row ${selectedId === contact.id ? "active" : ""}`} onClick={() => { setSelectedId(contact.id); if (contact.unread) relay({ type: "mark_read", commandId: crypto.randomUUID(), ts: Date.now(), contactId: contact.id }); }}><span className="avatar small">{initials(contact.localName ?? contact.displayName)}</span><span className="contact-copy"><strong>{contact.localName ?? contact.displayName}</strong><small>{contact.status === "request" ? "Wants to connect" : contact.verified ? "Verified contact" : "Encrypted conversation"}</small></span>{contact.unread > 0 && <span className="unread">{contact.unread}</span>}</button>)}</section><footer><span className={`network-dot ${primaryOffline ? "" : "online"}`} />{primaryOffline ? "Primary offline" : "Synced companion"}</footer></aside>
+    <section className="chat-panel mobile-visible">{selected ? <><header className="chat-header"><div className="avatar">{initials(selected.displayName)}</div><div><h2>{selected.localName ?? selected.displayName}</h2><p>{selected.verified ? "Identity verified by primary" : "Relayed through your primary device"}</p></div><span className="chat-spacer" /><button className="icon-button" title="Ask primary to mark verified" disabled={unlinked || selected.verified} onClick={() => relay({ type: "set_verified", commandId: crypto.randomUUID(), ts: Date.now(), contactId: selected.id })}><Fingerprint /></button></header>
+      {selected.status === "request" && <div className="request-banner"><div><strong>New message request</strong><span>Accept or block through your primary device.</span></div><button className="secondary" disabled={unlinked} onClick={() => relay({ type: "block_contact", commandId: crypto.randomUUID(), ts: Date.now(), contactId: selected.id })}>Block</button><button className="primary" disabled={unlinked} onClick={() => relay({ type: "accept_request", commandId: crypto.randomUUID(), ts: Date.now(), contactId: selected.id })}>Accept</button></div>}
+      <div className="message-scroll">{messages.map((message) => <div key={message.id} className={`message-row ${message.direction}`}><div className="message-body"><div className="bubble">{message.body}</div>{message.direction === "outgoing" && <span className={`delivery ${message.delivery}`}>{message.delivery.replace("-", " ")}{message.delivery === "failed" && <button className="retry-link" onClick={() => relay({ type: "retry_message", commandId: crypto.randomUUID(), ts: Date.now(), messageId: message.id })}>Retry</button>}</span>}</div></div>)}</div>
+      <div className="composer-wrap"><div className="composer"><textarea value={selected.draft} maxLength={16_384} disabled={unlinked || selected.status === "request"} onChange={(event) => { const next = structuredClone(accountRef.current); const contact = next.contacts.find((item) => item.id === selected.id); if (contact) contact.draft = event.target.value; void persist(next); }} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={primaryOffline ? "Queue a message for your primary…" : "Message through primary"} /><button className="send-button" onClick={() => void send()} disabled={unlinked || selected.status === "request" || !selected.draft.trim()}><Send /></button></div></div></> : <div className="empty-chat"><div className="empty-orbit"><MessageCircle /></div><span className="eyebrow">LINKED DEVICE</span><h2>Companion mirror</h2><p>Choose a conversation mirrored from your primary device.</p></div>}</section>
+  </main>;
+}
+
 export default function App() {
   const [screen, setScreen] = useState<Screen>("loading");
   const [account, setAccount] = useState<StoredAccount | null>(null);
@@ -615,6 +885,6 @@ export default function App() {
   if (screen === "welcome") return <WelcomeScreen onComplete={(state, password) => { setAccount(state); setPassphrase(password); setScreen("messenger"); }} />;
   if (screen === "locked") return <LockedScreen onUnlock={(state, password) => { setAccount(state); setPassphrase(password); setScreen("messenger"); }} onReset={async () => { if (confirm("Delete the encrypted Blackspace vault from this browser?")) { await deleteVault(); setScreen("welcome"); } }} />;
   if (!account) return null;
-  if (account.role === "companion") return <CompanionMessenger initial={account} passphrase={passphrase} onLock={() => { lockVault(); setAccount(null); setPassphrase(""); setScreen("locked"); }} />;
+  if (account.role === "companion") return <LinkedCompanionMessenger initial={account} passphrase={passphrase} onLock={() => { lockVault(); setAccount(null); setPassphrase(""); setScreen("locked"); }} onReset={() => void (async () => { if (confirm("Delete this encrypted companion mirror from this browser?")) { await deleteVault(); setAccount(null); setPassphrase(""); setScreen("welcome"); } })()} />;
   return <Messenger initial={account} passphrase={passphrase} onLock={() => { lockVault(); setAccount(null); setPassphrase(""); setScreen("locked"); }} />;
 }

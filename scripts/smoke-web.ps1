@@ -90,6 +90,24 @@ $accepted = Invoke-RestMethod -Method Post -Uri "$BaseUrl/v1/deposit/envelopes" 
 } -ContentType "application/blackspace-envelope+json" -Body $envelopeBody
 if (-not $accepted.accepted) { throw "The envelope was not accepted." }
 
+$newRead = New-Capability
+$rotationBody = @{ read_capability_verifier = Get-CapabilityVerifier "read" $newRead } | ConvertTo-Json -Compress
+$rotation = Invoke-RestMethod -Method Post -Uri "$BaseUrl/v1/mailbox/read-capability/rotate" -Headers @{
+    Authorization = "BlackspaceAdmin $admin"
+} -ContentType "application/json" -Body $rotationBody
+if (-not $rotation.ok) { throw "Read capability rotation did not succeed." }
+
+$oldReadRejected = $false
+try {
+    Invoke-RestMethod -Method Post -Uri "$BaseUrl/v1/mailbox/pull" -Headers @{
+        Authorization = "BlackspaceRead $read"
+    } -ContentType "application/json" -Body '{"limit":100}' | Out-Null
+} catch {
+    if ([int]$_.Exception.Response.StatusCode -eq 401) { $oldReadRejected = $true } else { throw }
+}
+if (-not $oldReadRejected) { throw "The old read capability still authorized after rotation." }
+$read = $newRead
+
 $pull = Invoke-RestMethod -Method Post -Uri "$BaseUrl/v1/mailbox/pull" -Headers @{
     Authorization = "BlackspaceRead $read"
 } -ContentType "application/json" -Body '{"limit":100}'

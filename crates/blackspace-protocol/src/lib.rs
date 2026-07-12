@@ -20,6 +20,7 @@ pub struct FeatureFlagsV1 {
     pub mls: bool,
     pub registration_invites: bool,
     pub recovery_takeover: bool,
+    pub companion_linking: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -56,6 +57,7 @@ impl Default for ServerInfoV1 {
                 mls: true,
                 registration_invites: true,
                 recovery_takeover: true,
+                companion_linking: true,
             },
         }
     }

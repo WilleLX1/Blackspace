@@ -57,6 +57,7 @@ export interface AccountState {
   messages: MessageRecord[];
   createdAt: number;
   companionLink?: CompanionLink;
+  pendingReadCapability?: string;
 }
 
 // Primary-side record of the single linked companion device (MVP: N=1).
@@ -92,6 +93,8 @@ export interface CompanionSide {
   uplinkOutbox: PendingEnvelope[];
   confirmed: boolean;
   lastDownlinkAt?: number;
+  appliedEventIds?: string[];
+  pendingDeliveries?: Record<string, DeliveryState>;
 }
 
 // A companion's read-only view of a contact. No deposit target, MLS group, or
@@ -150,6 +153,7 @@ export interface ServerInfo {
     mls: boolean;
     registration_invites: boolean;
     recovery_takeover: boolean;
+    companion_linking: boolean;
   };
 }
 

@@ -42,7 +42,7 @@ describe("private-alpha client framing", () => {
 
   it("still rejects HTTPS gateways carrying a path or credentials", () => {
     const identity = randomCapability();
-    for (const https_url of ["https://gateway.example.com/mailbox", "https://user:pass@gateway.example.com", "http://gateway.example.com:8443"]) {
+    for (const https_url of ["https://gateway.example.com/mailbox", "https://user:pass@gateway.example.com", "http://gateway.example.com:8443", "https://gateway.example.com/?query=1", "https://gateway.example.com/#fragment"]) {
       const invitation = formatContactInvitation(
         { onion_url: onion, https_url, deposit_capability: randomCapability() },
         identity,

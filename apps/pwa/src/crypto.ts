@@ -46,7 +46,7 @@ function optionalHttps(value: string | null): string | undefined {
   // rest of the origin stays locked down: https only, no embedded credentials,
   // and no path/query/fragment smuggled through the invitation. url.origin
   // preserves the explicit port when present and omits it for the default 443.
-  if (url.protocol !== "https:" || url.username || url.password || url.pathname !== "/") {
+  if (url.protocol !== "https:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
     throw new Error("The HTTPS gateway in the invitation is invalid.");
   }
   return url.origin;

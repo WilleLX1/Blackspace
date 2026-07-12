@@ -33,6 +33,7 @@ async function directionKey(linkSecret: string, pairingId: string, dir: "down" |
 // each direction has exactly one writer; the seq is persisted before use so a
 // crash/restore cannot roll it back into reuse.
 function nonceForSeq(seq: number): Uint8Array {
+  if (!Number.isSafeInteger(seq) || seq < 1) throw new Error("Link sequence must be a positive safe integer.");
   const nonce = new Uint8Array(12);
   const view = new DataView(nonce.buffer);
   view.setUint32(4, Math.floor(seq / 2 ** 32));
@@ -54,7 +55,7 @@ export async function sealLinkEvent(
   const key = await directionKey(linkSecret, pairingId, dir);
   const nonce = nonceForSeq(seq);
   const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv: nonce as BufferSource, additionalData: additionalData(dir, pairingId, seq) },
+    { name: "AES-GCM", iv: nonce as BufferSource, additionalData: additionalData(dir, pairingId, seq) as BufferSource },
     key,
     enc.encode(JSON.stringify(body)),
   ));
@@ -63,10 +64,10 @@ export async function sealLinkEvent(
 
 export async function openLinkEvent<T = unknown>(linkSecret: string, packet: LinkPacket): Promise<T> {
   const key = await directionKey(linkSecret, packet.pid, packet.dir);
-  // Derive the nonce from the authenticated seq rather than trusting packet.nonce.
   const nonce = nonceForSeq(packet.seq);
+  if (packet.nonce !== base64Url(nonce)) throw new Error("Link packet nonce does not match its sequence.");
   const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: nonce as BufferSource, additionalData: additionalData(packet.dir, packet.pid, packet.seq) },
+    { name: "AES-GCM", iv: nonce as BufferSource, additionalData: additionalData(packet.dir, packet.pid, packet.seq) as BufferSource },
     key,
     fromBase64Url(packet.ct) as BufferSource,
   );
@@ -111,7 +112,8 @@ export interface SnapshotPayload {
 }
 
 export type DownlinkEvent =
-  | { type: "snapshot"; eventId: string; ts: number; index: number; total: number; payload: SnapshotPayload }
+  | { type: "snapshot"; eventId: string; ts: number; payload: SnapshotPayload }
+  | { type: "snapshot_chunk"; eventId: string; ts: number; index: number; total: number; payload: SnapshotPayload }
   | { type: "message"; eventId: string; ts: number; contactId: string; message: MessageRecord }
   | { type: "delivery"; eventId: string; ts: number; messageId: string; delivery: DeliveryState; error?: string }
   | { type: "contact"; eventId: string; ts: number; contact: ContactProjection; removed?: boolean }
@@ -124,5 +126,7 @@ export type UplinkCommand =
   | { type: "accept_request"; commandId: string; ts: number; contactId: string }
   | { type: "block_contact"; commandId: string; ts: number; contactId: string }
   | { type: "set_verified"; commandId: string; ts: number; contactId: string }
+  | { type: "set_nickname"; commandId: string; ts: number; contactId: string; name: string }
+  | { type: "mark_read"; commandId: string; ts: number; contactId: string }
   | { type: "retry_message"; commandId: string; ts: number; messageId: string }
   | { type: "request_resnapshot"; commandId: string; ts: number; reason: string };
