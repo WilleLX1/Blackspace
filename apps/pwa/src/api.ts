@@ -75,6 +75,13 @@ export async function recoverMailbox(origin: string, oldAdminCapability: string,
   });
 }
 
+export async function rotateReadCapability(origin: string, adminCapability: string, verifier: string): Promise<void> {
+  if (isTauri()) { await invoke("rotate_read_capability", { serverUrl: origin, adminCapability, request: { read_capability_verifier: verifier } }); return; }
+  await jsonRequest(origin, "/v1/mailbox/read-capability/rotate", {
+    method: "POST", headers: { "content-type": "application/json", authorization: `BlackspaceAdmin ${adminCapability}` }, body: JSON.stringify({ read_capability_verifier: verifier }),
+  });
+}
+
 export async function claimKeyPackage(target: DepositTarget): Promise<KeyPackageWire> {
   if (isTauri()) {
     const response = await invoke<{ key_package: KeyPackageWire }>("claim_key_package", { target });

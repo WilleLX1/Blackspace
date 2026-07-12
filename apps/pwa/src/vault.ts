@@ -1,4 +1,4 @@
-import type { AccountState } from "./model";
+import type { AccountState, StoredAccount } from "./model";
 import { argon2id } from "hash-wasm";
 import { invoke } from "@tauri-apps/api/core";
 import { openRecoveryState, sealRecoveryState } from "./mls";
@@ -85,7 +85,7 @@ async function deriveWrappingKey(passphrase: string, salt: Uint8Array): Promise<
   return crypto.subtle.importKey("raw", raw as BufferSource, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
 
-async function createVault(state: AccountState, passphrase: string): Promise<EncryptedVault> {
+async function createVault(state: StoredAccount, passphrase: string): Promise<EncryptedVault> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const wrapNonce = crypto.getRandomValues(new Uint8Array(12));
   const rawVaultKey = crypto.getRandomValues(new Uint8Array(32));
@@ -105,7 +105,7 @@ async function unwrapVaultKey(record: EncryptedVault, passphrase: string): Promi
   return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
 
-async function encryptRecord(state: AccountState, wrapper: EncryptedVault, vaultKey: CryptoKey): Promise<EncryptedVault> {
+async function encryptRecord(state: StoredAccount, wrapper: EncryptedVault, vaultKey: CryptoKey): Promise<EncryptedVault> {
   const nonce = crypto.getRandomValues(new Uint8Array(12));
   const plaintext = new TextEncoder().encode(JSON.stringify(state));
   const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
@@ -114,11 +114,11 @@ async function encryptRecord(state: AccountState, wrapper: EncryptedVault, vault
   return { ...wrapper, recordNonce: encode(nonce), ciphertext: encode(ciphertext) };
 }
 
-async function decryptRecord(record: EncryptedVault, vaultKey: CryptoKey): Promise<AccountState> {
+async function decryptRecord(record: EncryptedVault, vaultKey: CryptoKey): Promise<StoredAccount> {
   const plaintext = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv: decode(record.recordNonce) as BufferSource, additionalData: RECORD_AAD }, vaultKey, decode(record.ciphertext),
   );
-  return JSON.parse(new TextDecoder().decode(plaintext)) as AccountState;
+  return JSON.parse(new TextDecoder().decode(plaintext)) as StoredAccount;
 }
 
 async function decryptLegacy(record: LegacyVault, passphrase: string): Promise<AccountState> {
@@ -136,7 +136,7 @@ export async function vaultExists(): Promise<boolean> {
   return Boolean(await readRecord());
 }
 
-export async function saveVault(state: AccountState, passphrase: string): Promise<void> {
+export async function saveVault(state: StoredAccount, passphrase: string): Promise<void> {
   if (isTauri()) { await invoke("native_save_vault", { state, passphrase }); return; }
   const existing = await readRecord();
   if (!existing || existing.version === 1) {
@@ -148,8 +148,8 @@ export async function saveVault(state: AccountState, passphrase: string): Promis
   await writeRecord(await encryptRecord(state, existing, key));
 }
 
-export async function unlockVault(passphrase: string): Promise<AccountState> {
-  if (isTauri()) return invoke<AccountState>("native_unlock_vault", { passphrase });
+export async function unlockVault(passphrase: string): Promise<StoredAccount> {
+  if (isTauri()) return invoke<StoredAccount>("native_unlock_vault", { passphrase });
   const record = await readRecord();
   if (!record) throw new Error("No Blackspace vault was found.");
   try {
@@ -203,7 +203,7 @@ export async function openRecoveryKit(contents: Uint8Array, passphrase: string):
     const parsed = parseLegacyRecoveryKit(contents);
     try {
       if (parsed.vault.version === 1) return await decryptLegacy(parsed.vault, passphrase);
-      return await decryptRecord(parsed.vault, await unwrapVaultKey(parsed.vault, passphrase));
+      return await decryptRecord(parsed.vault, await unwrapVaultKey(parsed.vault, passphrase)) as AccountState;
     } catch {
       throw new Error("The recovery passphrase is incorrect or the recovery kit is damaged.");
     }

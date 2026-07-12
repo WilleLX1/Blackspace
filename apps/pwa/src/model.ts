@@ -42,6 +42,7 @@ export interface ContactRecord {
 
 export interface AccountState {
   version: 1;
+  role?: "primary";
   displayName: string;
   instanceName: string;
   mailboxId: string;
@@ -55,7 +56,77 @@ export interface AccountState {
   contacts: ContactRecord[];
   messages: MessageRecord[];
   createdAt: number;
+  companionLink?: CompanionLink;
 }
+
+// Primary-side record of the single linked companion device (MVP: N=1).
+// The linkSecret and downlink deposit-cap secret let the primary mirror state;
+// the *Id fields drive ack dispatch (recognize/skip own downlink, apply uplink)
+// and revocation. The uplink deposit-cap secret is never persisted here.
+export interface CompanionLink {
+  pairingId: string;
+  active: boolean;
+  createdAt: number;
+  confirmedAt?: number;
+  lastUplinkAt?: number;
+  label?: string;
+  linkSecret: string;
+  downlinkCap: string;
+  downlinkCapId: string;
+  uplinkCapId: string;
+  downSeq: number;
+  upLastApplied: number;
+  downlinkOutbox: PendingEnvelope[];
+}
+
+// Companion-side link state. Holds the shared read cap and the uplink deposit-cap
+// secret; never holds the identity private key or any MLS state.
+export interface CompanionSide {
+  pairingId: string;
+  linkSecret: string;
+  downlinkCapId: string;
+  uplinkCap: string;
+  uplinkCapId: string;
+  downLastApplied: number;
+  upSeq: number;
+  uplinkOutbox: PendingEnvelope[];
+  confirmed: boolean;
+  lastDownlinkAt?: number;
+}
+
+// A companion's read-only view of a contact. No deposit target, MLS group, or
+// inbound capability — the companion never talks MLS or mints capabilities.
+export interface ContactProjection {
+  id: string;
+  identityPublicKey: string;
+  displayName: string;
+  localName?: string;
+  status: "pending" | "request" | "accepted" | "blocked";
+  verified: boolean;
+  unread: number;
+  draft: string;
+  lastMessageAt: number;
+}
+
+// The reduced, MLS-free projection persisted on a companion device.
+export interface CompanionAccountState {
+  version: 1;
+  role: "companion";
+  displayName: string;
+  instanceName: string;
+  mailboxId: string;
+  onionOrigin: string;
+  httpsOrigin?: string;
+  createdAt: number;
+  readCapability: string;
+  identityPublicKey: string;
+  link: CompanionSide;
+  contacts: ContactProjection[];
+  messages: MessageRecord[];
+}
+
+// What the vault actually stores; the role discriminant selects the client shell.
+export type StoredAccount = AccountState | CompanionAccountState;
 
 export interface KeyPackageWire {
   package_id: string;

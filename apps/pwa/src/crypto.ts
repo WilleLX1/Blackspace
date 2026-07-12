@@ -94,7 +94,9 @@ export function formatContactInvitation(target: DepositTarget, identityPublicKey
 
 export interface MlsBootstrapPacket { kind: "mls_bootstrap"; welcome: string; firstMessage: string }
 export interface MlsPacket { kind: "mls"; hint: string; message: string }
-export type OpaquePacket = MlsBootstrapPacket | MlsPacket;
+// Device-sync packet (primary<->companion). Only `ct` is confidential; see link.ts.
+export interface LinkPacket { kind: "link"; dir: "down" | "up"; pid: string; seq: number; nonce: string; ct: string }
+export type OpaquePacket = MlsBootstrapPacket | MlsPacket | LinkPacket;
 
 export interface SecureContent {
   version: 1;

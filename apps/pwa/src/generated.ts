@@ -128,6 +128,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/mailbox/read-capability/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["api_rotate_read_capability"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/mailbox/recover": {
         parameters: {
             query?: never;
@@ -284,6 +300,16 @@ export interface components {
             mailbox_id: string;
             /** Format: int64 */
             purged_envelopes: number;
+        };
+        /**
+         * @description Rotate only the mailbox read capability. Used to cut a linked companion's
+         *     read access on unlink without the destructive full recovery/takeover flow.
+         */
+        RotateReadCapabilityRequestV1: {
+            read_capability_verifier: string;
+        };
+        RotateReadCapabilityResponseV1: {
+            ok: boolean;
         };
         ServerInfoV1: {
             /** Format: int64 */
@@ -537,6 +563,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PullResponseV1"];
+                };
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemV1"];
+                };
+            };
+        };
+    };
+    api_rotate_read_capability: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RotateReadCapabilityRequestV1"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RotateReadCapabilityResponseV1"];
                 };
             };
             401: {

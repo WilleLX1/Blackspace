@@ -287,6 +287,44 @@
         }
       }
     },
+    "/v1/mailbox/read-capability/rotate": {
+      "post": {
+        "tags": [],
+        "operationId": "api_rotate_read_capability",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RotateReadCapabilityRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RotateReadCapabilityResponseV1"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/mailbox/recover": {
       "post": {
         "tags": [],
@@ -787,6 +825,29 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "RotateReadCapabilityRequestV1": {
+        "type": "object",
+        "description": "Rotate only the mailbox read capability. Used to cut a linked companion's\nread access on unlink without the destructive full recovery/takeover flow.",
+        "required": [
+          "read_capability_verifier"
+        ],
+        "properties": {
+          "read_capability_verifier": {
+            "type": "string"
+          }
+        }
+      },
+      "RotateReadCapabilityResponseV1": {
+        "type": "object",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
           }
         }
       },

@@ -138,6 +138,18 @@ pub struct RecoverMailboxResponseV1 {
     pub purged_envelopes: u64,
 }
 
+/// Rotate only the mailbox read capability. Used to cut a linked companion's
+/// read access on unlink without the destructive full recovery/takeover flow.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct RotateReadCapabilityRequestV1 {
+    pub read_capability_verifier: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct RotateReadCapabilityResponseV1 {
+    pub ok: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct EnvelopeV1 {
     pub version: u16,
@@ -249,6 +261,11 @@ pub fn api_acknowledge_envelopes() {}
     responses((status = 200, body = RecoverMailboxResponseV1), (status = 401, body = ProblemV1)))]
 pub fn api_recover_mailbox() {}
 
+#[doc(hidden)]
+#[utoipa::path(post, path = "/v1/mailbox/read-capability/rotate", request_body = RotateReadCapabilityRequestV1,
+    responses((status = 200, body = RotateReadCapabilityResponseV1), (status = 401, body = ProblemV1)))]
+pub fn api_rotate_read_capability() {}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -261,7 +278,8 @@ pub fn api_recover_mailbox() {}
         api_deposit_envelope,
         api_pull_envelopes,
         api_acknowledge_envelopes,
-        api_recover_mailbox
+        api_recover_mailbox,
+        api_rotate_read_capability
     ),
     components(schemas(
         FeatureFlagsV1,
@@ -277,6 +295,8 @@ pub fn api_recover_mailbox() {}
         ClaimKeyPackageResponseV1,
         RecoverMailboxRequestV1,
         RecoverMailboxResponseV1,
+        RotateReadCapabilityRequestV1,
+        RotateReadCapabilityResponseV1,
         EnvelopeV1,
         DepositAcceptedV1,
         PullRequestV1,

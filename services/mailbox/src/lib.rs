@@ -23,7 +23,8 @@ use blackspace_protocol::{
     MAX_KEY_PACKAGE_BATCH, MAX_PULL_BATCH, MAX_QUEUED_ENVELOPES, MAX_RETENTION_SECONDS,
     MailboxProvisionRequestV1, MailboxProvisionResponseV1, ProblemV1, PublishKeyPackagesRequestV1,
     PublishKeyPackagesResponseV1, PullRequestV1, PullResponseV1, PulledEnvelopeV1,
-    RecoverMailboxRequestV1, RecoverMailboxResponseV1, SIZE_CLASSES, ServerInfoV1,
+    RecoverMailboxRequestV1, RecoverMailboxResponseV1, RotateReadCapabilityRequestV1,
+    RotateReadCapabilityResponseV1, SIZE_CLASSES, ServerInfoV1,
 };
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use subtle::ConstantTimeEq;
@@ -244,6 +245,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/mailbox/key-packages", post(publish_key_packages))
         .route("/v1/mailbox/recover", post(recover_mailbox))
+        .route(
+            "/v1/mailbox/read-capability/rotate",
+            post(rotate_read_capability),
+        )
         .route("/v1/deposit/key-packages/claim", post(claim_key_package))
         .route("/v1/deposit/envelopes", post(deposit_envelope))
         .route("/v1/mailbox/pull", post(pull_envelopes))
@@ -463,6 +468,33 @@ async fn revoke_deposit_capability(
     sqlx::query("UPDATE deposit_capabilities SET revoked_at=now() WHERE id=$1 AND mailbox_id=$2 AND revoked_at IS NULL")
         .bind(capability_id).bind(mailbox_id).execute(&state.pool).await.map_err(ApiError::internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Rotate only the read capability. Admin-authorized; leaves deposit capabilities,
+/// key packages, and the queued envelopes intact. Used to cut a linked companion's
+/// read access on unlink without the destructive recovery/takeover flow.
+async fn rotate_read_capability(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RotateReadCapabilityRequestV1>,
+) -> Result<Json<RotateReadCapabilityResponseV1>, ApiError> {
+    let mailbox_id = authorize_mailbox(
+        &state.pool,
+        &headers,
+        "BlackspaceAdmin",
+        CapabilityKind::Admin,
+        "admin_capability_verifier",
+    )
+    .await?;
+    let verifier =
+        decode_verifier(&request.read_capability_verifier).map_err(|_| ApiError::invalid_request())?;
+    sqlx::query("UPDATE mailboxes SET read_capability_verifier=$1 WHERE id=$2")
+        .bind(verifier.as_slice())
+        .bind(mailbox_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|error| map_conflict(error, "read_capability_conflict"))?;
+    Ok(Json(RotateReadCapabilityResponseV1 { ok: true }))
 }
 
 async fn publish_key_packages(

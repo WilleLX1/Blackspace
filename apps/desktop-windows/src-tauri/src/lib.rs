@@ -7,7 +7,8 @@ use blackspace_protocol::{
     CreateDepositCapabilityResponseV1, DepositAcceptedV1, DepositTargetV1, EnvelopeV1,
     MailboxProvisionRequestV1, MailboxProvisionResponseV1, ProblemV1, PublishKeyPackagesRequestV1,
     PublishKeyPackagesResponseV1, PullRequestV1, PullResponseV1, RecoverMailboxRequestV1,
-    RecoverMailboxResponseV1, ServerInfoV1,
+    RecoverMailboxResponseV1, RotateReadCapabilityRequestV1, RotateReadCapabilityResponseV1,
+    ServerInfoV1,
 };
 use blackspace_tor::{
     parse_bootstrap_progress, parse_control_port_file, parse_socks_listener,
@@ -607,6 +608,26 @@ async fn recover_mailbox(
 }
 
 #[tauri::command]
+async fn rotate_read_capability(
+    manager: State<'_, Arc<TorManager>>,
+    server_url: String,
+    admin_capability: String,
+    request: RotateReadCapabilityRequestV1,
+) -> Result<RotateReadCapabilityResponseV1, String> {
+    let (client, origin) = tor_client(&manager, &server_url).await?;
+    request_json(
+        client
+            .post(format!("{origin}/v1/mailbox/read-capability/rotate"))
+            .header(
+                "authorization",
+                format!("BlackspaceAdmin {admin_capability}"),
+            )
+            .json(&request),
+    )
+    .await
+}
+
+#[tauri::command]
 async fn pull_envelopes(
     manager: State<'_, Arc<TorManager>>,
     server_url: String,
@@ -676,6 +697,7 @@ pub fn run() {
             claim_key_package,
             publish_key_packages,
             recover_mailbox,
+            rotate_read_capability,
             initialize_core_identity,
             core_start_conversation,
             native_vault::native_vault_exists,
