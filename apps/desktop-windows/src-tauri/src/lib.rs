@@ -147,16 +147,26 @@ impl TorManager {
     }
 
     async fn ready_socks(&self) -> Result<String, String> {
-        let runtime = self.runtime.lock().await;
-        if !matches!(runtime.status.phase, TorPhase::Ready) {
-            return Err(
-                "Tor is not ready. Blackspace will not use a direct connection.".to_string(),
-            );
+        // UI polling can begin while the managed sidecar is still bootstrapping.
+        // Wait for that bounded startup window while continuing to fail closed:
+        // no request is ever attempted without a ready SOCKS listener.
+        for _ in 0..60 {
+            let runtime = self.runtime.lock().await;
+            if matches!(runtime.status.phase, TorPhase::Ready) {
+                return runtime
+                    .socks_address
+                    .clone()
+                    .ok_or_else(|| "Tor SOCKS listener is unavailable.".to_string());
+            }
+            if matches!(runtime.status.phase, TorPhase::Failed | TorPhase::Stopped) {
+                return Err(
+                    "Tor is not ready. Blackspace will not use a direct connection.".to_string(),
+                );
+            }
+            drop(runtime);
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        runtime
-            .socks_address
-            .clone()
-            .ok_or_else(|| "Tor SOCKS listener is unavailable.".to_string())
+        Err("Tor is not ready. Blackspace will not use a direct connection.".to_string())
     }
 
     async fn client_for_destination(&self, origin: &str) -> Result<Client, String> {
@@ -213,6 +223,7 @@ impl TorManager {
         tokio::fs::create_dir_all(&data_dir)
             .await
             .map_err(|error| error.to_string())?;
+        shutdown_stale_managed_tor(&control_file, &cookie_file).await;
         let _ = tokio::fs::remove_file(&control_file).await;
         let _ = tokio::fs::remove_file(&cookie_file).await;
 
@@ -335,6 +346,32 @@ impl TorManager {
         };
         drop(runtime);
         self.destination_clients.lock().await.clear();
+    }
+}
+
+async fn shutdown_stale_managed_tor(control_file: &std::path::Path, cookie_file: &std::path::Path) {
+    let Ok(control_value) = tokio::fs::read_to_string(control_file).await else {
+        return;
+    };
+    let Ok(cookie) = tokio::fs::read(cookie_file).await else {
+        return;
+    };
+    let Ok(control_address) = parse_control_port_file(&control_value) else {
+        return;
+    };
+    if control_query(&control_address, &cookie, "SIGNAL SHUTDOWN\r\n")
+        .await
+        .is_err()
+    {
+        return;
+    }
+    // Tor acknowledges before its process and DataDirectory lock have fully
+    // disappeared. Wait briefly so the replacement sidecar cannot race it.
+    for _ in 0..20 {
+        if TcpStream::connect(&control_address).await.is_err() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

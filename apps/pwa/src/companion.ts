@@ -28,6 +28,8 @@ export function buildSnapshot(state: AccountState): SnapshotPayload {
     displayName: state.displayName,
     instanceName: state.instanceName,
     identityPublicKey: state.identityPublicKey,
+    onionOrigin: state.onionOrigin,
+    httpsOrigin: state.httpsOrigin,
     contacts: state.contacts.map(projectContact),
     messages,
   };
@@ -45,6 +47,8 @@ export function applyDownlinkEvent(state: CompanionAccountState, event: Downlink
     next.displayName = event.payload.displayName;
     next.instanceName = event.payload.instanceName;
     next.identityPublicKey = event.payload.identityPublicKey;
+    if (event.payload.onionOrigin) next.onionOrigin = event.payload.onionOrigin;
+    next.httpsOrigin = event.payload.httpsOrigin;
     next.contacts = event.payload.contacts;
     next.messages = event.payload.messages;
   } else if (event.type === "message") {

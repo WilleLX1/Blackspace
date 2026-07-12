@@ -107,6 +107,8 @@ export interface SnapshotPayload {
   displayName: string;
   instanceName: string;
   identityPublicKey: string;
+  onionOrigin?: string;
+  httpsOrigin?: string;
   contacts: ContactProjection[];
   messages: MessageRecord[];
 }

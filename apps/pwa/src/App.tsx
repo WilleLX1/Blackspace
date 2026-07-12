@@ -19,12 +19,12 @@ import {
 import { base64Url } from "./crypto";
 import { errorMessage } from "./errors";
 import { contactFingerprint, decodeSecureContent, encodeSecureContent, mlsCreateMessage, mlsGenerate, mlsGroupHint, mlsJoin, mlsProcessMessage, mlsRecoveryIdentitySnapshot, mlsReplenish, mlsStart } from "./mls";
-import type { AccountState, CompanionAccountState, ContactRecord, DepositTarget, KeyPackageWire, MessageRecord, PendingEnvelope, StoredAccount } from "./model";
+import type { AccountState, CompanionAccountState, ContactRecord, DepositTarget, KeyPackageWire, MessageRecord, PendingEnvelope, ServerInfo, StoredAccount } from "./model";
 import { onboardingError, type OnboardingStage } from "./onboarding";
 import { applyDownlinkEvent, buildSnapshot, newMessage, projectContact } from "./companion";
 import { classify, openLinkEvent, sealLinkEvent, type DownlinkEvent, type UplinkCommand } from "./link";
 import { createCompanionPairingOffer, createPrimaryPairingResponse, openPrimaryPairingResponse, type CompanionPairingOffer, type PairingBundle } from "./pairing";
-import { detectTransportMode, deriveTransportMode, modeLabel } from "./security";
+import { detectTransportMode, deriveTransportMode, modeLabel, validateServerUrl } from "./security";
 import { createRecoveryKit, deleteVault, lockVault, openRecoveryKit, saveVault, unlockVault, vaultExists } from "./vault";
 import { scanQr } from "./qr";
 
@@ -44,6 +44,10 @@ const validateClaimedPackage = (claimed: KeyPackageWire, identity: string) => {
     throw new Error("The claimed OpenMLS key package is invalid, expired, or belongs to another identity.");
   }
 };
+const advertisedOrigins = (info: ServerInfo, fallbackOnion: string): { onionOrigin: string; httpsOrigin?: string } => ({
+  onionOrigin: validateServerUrl(info.onion_origin ?? fallbackOnion, "tor-native"),
+  httpsOrigin: info.https_origin ? validateServerUrl(info.https_origin, "https-web") : undefined,
+});
 
 function ModeBadge() {
   const mode = detectTransportMode();
@@ -81,6 +85,7 @@ function WelcomeScreen({ onComplete }: { onComplete(state: StoredAccount, passph
       const join = parseJoinInvitation(invitation);
       const origin = ownOrigin(join.onionOrigin, join.httpsOrigin);
       const info = await serverInfo(origin);
+      const advertised = advertisedOrigins(info, join.onionOrigin);
       if (!info.features.mls || !info.features.registration_invites) throw new Error("This server does not support the v0.1 private-alpha protocol.");
       const attemptKey = `${invitation.trim()}\0${displayName.trim()}`;
       if (!attempt.current || attempt.current.key !== attemptKey) {
@@ -109,7 +114,7 @@ function WelcomeScreen({ onComplete }: { onComplete(state: StoredAccount, passph
       const provisioned = await provisionMailbox(origin, join.token, current.request);
       const state: AccountState = {
         version: 1, displayName: displayName.trim(), instanceName: info.instance_name,
-        mailboxId: provisioned.mailbox_id, onionOrigin: join.onionOrigin, httpsOrigin: join.httpsOrigin,
+        mailboxId: provisioned.mailbox_id, onionOrigin: advertised.onionOrigin, httpsOrigin: advertised.httpsOrigin,
         readCapability: current.readCapability, adminCapability: current.adminCapability, identityPublicKey: current.identityPublicKey,
         mlsClientState: current.mlsClientState, availableKeyPackages: 20,
         contacts: [], messages: [], createdAt: Date.now(),
@@ -268,6 +273,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   const [busy, setBusy] = useState(false);
   const [linkSetup, setLinkSetup] = useState<{ pairingId: string; qr: string; qrImage: string; sas: string; linkSecret: string; downlinkCap: string; downlinkCapId: string; uplinkCapId: string }>();
   const syncing = useRef(false);
+  const syncFailures = useRef(0);
   const resumedPendingRotation = useRef(false);
   const mirrorChain = useRef<Promise<unknown>>(Promise.resolve());
   accountRef.current = account;
@@ -307,6 +313,43 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   const filtered = account.contacts.filter((contact) => contact.status !== "blocked" && (contact.localName ?? contact.displayName).toLowerCase().includes(search.toLowerCase()));
   const requests = filtered.filter((contact) => contact.status === "request");
   const conversations = filtered.filter((contact) => contact.status !== "request");
+
+  useEffect(() => {
+    let cancelled = false;
+    void serverInfo(ownServer).then(async (info) => {
+      if (cancelled) return;
+      const advertised = advertisedOrigins(info, accountRef.current.onionOrigin);
+      const current = accountRef.current;
+      if (current.onionOrigin === advertised.onionOrigin && current.httpsOrigin === advertised.httpsOrigin) return;
+      await runExclusive(async () => {
+        let next = structuredClone(accountRef.current); next.onionOrigin = advertised.onionOrigin; next.httpsOrigin = advertised.httpsOrigin;
+        await persist(next);
+        // Existing contacts learned our old gateway inside an authenticated MLS
+        // profile. Send a fresh, encrypted reply target so they can replace it
+        // without trusting an unsigned contact-invitation update.
+        for (const existing of [...next.contacts]) {
+          if (!existing.mlsGroupId || existing.status === "blocked") continue;
+          const replacementCapability = randomCapability();
+          let replacementId = "";
+          try {
+            replacementId = (await createDepositCapability(ownServer, next.adminCapability, await capabilityVerifier("deposit", replacementCapability))).capability_id;
+            const replyInvitation = formatContactInvitation({ onion_url: next.onionOrigin, https_url: next.httpsOrigin, deposit_capability: replacementCapability }, next.identityPublicKey, crypto.randomUUID());
+            const content: SecureContent = { version: 1, type: "profile", messageId: crypto.randomUUID(), sentAt: Date.now(), senderIdentity: next.identityPublicKey, displayName: next.displayName, replyInvitation };
+            const encrypted = await mlsCreateMessage(next.mlsClientState, existing.mlsGroupId, await encodeSecureContent(content));
+            next = structuredClone(accountRef.current); next.mlsClientState = encrypted.client_state; await persist(next);
+            await depositEnvelope(existing.target, envelopeForPacket({ kind: "mls", hint: await mlsGroupHint(existing.mlsGroupId), message: encrypted.message }));
+            const updated = structuredClone(accountRef.current); const contact = updated.contacts.find((item) => item.id === existing.id);
+            if (contact) { const previousId = contact.inboundCapabilityId; contact.inboundCapabilityId = replacementId; await persist(updated); if (previousId) await revokeDepositCapability(ownServer, updated.adminCapability, previousId).catch(() => undefined); }
+            next = accountRef.current;
+          } catch {
+            if (replacementId) await revokeDepositCapability(ownServer, accountRef.current.adminCapability, replacementId).catch(() => undefined);
+          }
+        }
+      });
+      await queueMirrorSnapshot();
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [ownServer, persist, queueMirrorSnapshot, runExclusive]);
 
   useEffect(() => {
     const pending = accountRef.current.pendingReadCapability; if (!pending || resumedPendingRotation.current) return; resumedPendingRotation.current = true;
@@ -364,7 +407,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
       }
       if (outboxChanged) await persist(current);
       const pulled = await pullEnvelopes(ownOrigin(current.onionOrigin, current.httpsOrigin), current.readCapability);
-      if (!pulled.length) return;
+      if (!pulled.length) { syncFailures.current = 0; return; }
       let next = structuredClone(current);
       const acknowledged: string[] = [];
       const receipts: Array<{ contactId: string; messageId: string }> = [];
@@ -442,6 +485,11 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
               for (const id of content.deliveredIds ?? []) { const message = next.messages.find((item) => item.id === id); if (message) message.delivery = "delivered"; }
             } else if (content.type === "profile" && content.displayName) {
               contact.displayName = content.displayName.slice(0, 64);
+              if (content.replyInvitation) {
+                const reply = parseContactInvitation(content.replyInvitation);
+                if (reply.identityPublicKey !== contact.identityPublicKey) throw new Error("The refreshed reply target does not match the MLS identity.");
+                contact.target = { onion_url: reply.onionOrigin, https_url: reply.httpsOrigin, deposit_capability: reply.capability };
+              }
             }
           } else {
             throw new Error("Legacy transport packets are not accepted by this private-alpha client.");
@@ -478,7 +526,13 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
         }
       }
       });
-    } catch (cause) { if (navigator.onLine) setError(errorMessage(cause, "Mailbox sync failed.")); }
+      syncFailures.current = 0;
+    } catch (cause) {
+      syncFailures.current += 1;
+      const message = errorMessage(cause, "Mailbox sync failed.");
+      if (message === "Tor is not ready. Blackspace will not use a direct connection.") return;
+      if (navigator.onLine && syncFailures.current >= 3) setError(message);
+    }
     finally { syncing.current = false; }
   }, [persist, selectedId, sendReceipt, runExclusive]);
 
@@ -492,10 +546,16 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   const makeInvite = async () => {
     setBusy(true); setError("");
     try {
+      const info = await serverInfo(ownServer);
+      const advertised = advertisedOrigins(info, accountRef.current.onionOrigin);
+      let current = accountRef.current;
+      if (current.onionOrigin !== advertised.onionOrigin || current.httpsOrigin !== advertised.httpsOrigin) {
+        const next = structuredClone(current); next.onionOrigin = advertised.onionOrigin; next.httpsOrigin = advertised.httpsOrigin; await persist(next); current = next;
+      }
       const capability = randomCapability();
-      await createDepositCapability(ownServer, account.adminCapability, await capabilityVerifier("deposit", capability));
-      const value = formatContactInvitation({ onion_url: account.onionOrigin, https_url: account.httpsOrigin, deposit_capability: capability }, account.identityPublicKey, crypto.randomUUID());
-      setInviteValue(value); setInviteQr(await QRCode.toDataURL(value, { width: 240, margin: 2, color: { dark: "#17121f", light: "#ffffff" } })); setDialog("invite");
+      await createDepositCapability(ownServer, current.adminCapability, await capabilityVerifier("deposit", capability));
+      const value = formatContactInvitation({ onion_url: current.onionOrigin, https_url: current.httpsOrigin, deposit_capability: capability }, current.identityPublicKey, crypto.randomUUID());
+      setInviteValue(value); setInviteQr(await QRCode.toDataURL(value, { width: 768, margin: 4, errorCorrectionLevel: "L", color: { dark: "#17121f", light: "#ffffff" } })); setDialog("invite");
     } catch (cause) { setError(errorMessage(cause, "Could not create an invitation.")); }
     finally { setBusy(false); }
   };
@@ -802,6 +862,7 @@ function LinkedCompanionMessenger({ initial, passphrase, onLock, onReset }: { in
   const [selectedId, setSelectedId] = useState(initial.contacts.find((contact) => contact.status === "accepted")?.id ?? "");
   const [error, setError] = useState(""); const [unlinked, setUnlinked] = useState(false); const [now, setNow] = useState(Date.now());
   const syncing = useRef(false);
+  const syncFailures = useRef(0);
   const commandChain = useRef<Promise<unknown>>(Promise.resolve());
   const persist = useCallback(async (next: CompanionAccountState) => { accountRef.current = next; setAccount(next); await saveVault(next, passphrase); }, [passphrase]);
   const ownServer = ownOrigin(account.onionOrigin, account.httpsOrigin);
@@ -843,9 +904,13 @@ function LinkedCompanionMessenger({ initial, passphrase, onLock, onReset }: { in
       await persist(next);
       if (acknowledged.length) await acknowledgeEnvelopes(ownOrigin(next.onionOrigin, next.httpsOrigin), next.readCapability, acknowledged);
       if (gap) await queueCommand({ type: "request_resnapshot", commandId: crypto.randomUUID(), ts: Date.now(), reason: "sequence gap" });
+      syncFailures.current = 0;
     } catch (cause) {
+      syncFailures.current += 1;
       const message = errorMessage(cause, "Companion sync failed.");
-      if (/401|authorization failed/i.test(message)) setUnlinked(true); else setError(message);
+      if (/401|authorization failed/i.test(message)) setUnlinked(true);
+      else if (message === "Tor is not ready. Blackspace will not use a direct connection.") return;
+      else if (syncFailures.current >= 3) setError(message);
     } finally { syncing.current = false; }
   }, [persist, queueCommand, unlinked]);
 

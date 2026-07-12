@@ -13,7 +13,15 @@ class MailboxOperationError extends Error {
 async function jsonRequest<T>(origin: string, path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${origin}${path}`, { redirect: "error", credentials: "omit", cache: "no-store", ...init });
   if (!response.ok) throw new MailboxOperationError(response.status);
-  return response.json() as Promise<T>;
+  const body = await response.text();
+  if (!body.trim()) throw new Error("Mailbox returned an empty response.");
+  try { return JSON.parse(body) as T; }
+  catch { throw new Error("Mailbox returned an invalid JSON response."); }
+}
+
+async function noContentRequest(origin: string, path: string, init?: RequestInit): Promise<void> {
+  const response = await fetch(`${origin}${path}`, { redirect: "error", credentials: "omit", cache: "no-store", ...init });
+  if (!response.ok) throw new MailboxOperationError(response.status);
 }
 
 export function ownOrigin(onionOrigin: string, httpsOrigin?: string): string {
@@ -55,7 +63,7 @@ export async function createDepositCapability(origin: string, adminCapability: s
 
 export async function revokeDepositCapability(origin: string, adminCapability: string, capabilityId: string): Promise<void> {
   if (isTauri()) { await invoke("revoke_deposit_capability", { serverUrl: origin, adminCapability, capabilityId }); return; }
-  await jsonRequest(origin, `/v1/mailbox/deposit-capabilities/${encodeURIComponent(capabilityId)}`, {
+  await noContentRequest(origin, `/v1/mailbox/deposit-capabilities/${encodeURIComponent(capabilityId)}`, {
     method: "DELETE", headers: { authorization: `BlackspaceAdmin ${adminCapability}` },
   });
 }
