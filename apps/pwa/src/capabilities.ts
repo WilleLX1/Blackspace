@@ -6,15 +6,21 @@ function base64Url(bytes: Uint8Array): string {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
 }
 
+function fillRandom(bytes: Uint8Array): void {
+  for (let offset = 0; offset < bytes.length; offset += 65_536) {
+    crypto.getRandomValues(bytes.subarray(offset, Math.min(offset + 65_536, bytes.length)));
+  }
+}
+
 export function randomCapability(): string {
   const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
+  fillRandom(bytes);
   return base64Url(bytes);
 }
 
 export function randomCiphertext(size = 4096): string {
   const bytes = new Uint8Array(size);
-  crypto.getRandomValues(bytes);
+  fillRandom(bytes);
   return base64Url(bytes);
 }
 
@@ -34,4 +40,3 @@ export async function capabilityVerifier(
   input.set(decoded, domain.length);
   return base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", input)));
 }
-

@@ -18,12 +18,15 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use blackspace_capabilities::{CapabilityKind, decode_verifier, generate_capability, verifier};
 use blackspace_protocol::{
-    AckRequestV1, AckResponseV1, ClaimKeyPackageResponseV1, CreateDepositCapabilityRequestV1,
-    CreateDepositCapabilityResponseV1, DepositAcceptedV1, EnvelopeV1, KeyPackageV1,
-    MAX_KEY_PACKAGE_BATCH, MAX_PULL_BATCH, MAX_QUEUED_ENVELOPES, MAX_RETENTION_SECONDS,
-    MailboxProvisionRequestV1, MailboxProvisionResponseV1, ProblemV1, PublishKeyPackagesRequestV1,
-    PublishKeyPackagesResponseV1, PullRequestV1, PullResponseV1, PulledEnvelopeV1,
-    RecoverMailboxRequestV1, RecoverMailboxResponseV1, RotateReadCapabilityRequestV1,
+    AckRequestV1, AckResponseV1, ClaimEnrollmentParcelResponseV1, ClaimKeyPackageResponseV1,
+    CreateDepositCapabilityRequestV1, CreateDepositCapabilityResponseV1, DepositAcceptedV1,
+    DeviceV1, EnvelopeV1, KeyPackageV1, ListDevicesResponseV1, MAX_KEY_PACKAGE_BATCH,
+    MAX_PULL_BATCH, MAX_QUEUED_ENVELOPES, MAX_RETENTION_SECONDS, MLS_STATE_SIZE_CLASSES,
+    MailboxProvisionRequestV1, MailboxProvisionResponseV1, MlsStateResponseV1,
+    ParkEnrollmentParcelRequestV1, ParkEnrollmentParcelResponseV1, ProblemV1,
+    PublishKeyPackagesRequestV1, PublishKeyPackagesResponseV1, PullRequestV1, PullResponseV1,
+    PulledEnvelopeV1, PutMlsStateRequestV1, PutMlsStateResponseV1, RecoverMailboxRequestV1,
+    RecoverMailboxResponseV1, RegisterDeviceRequestV1, RotateReadCapabilityRequestV1,
     RotateReadCapabilityResponseV1, SIZE_CLASSES, ServerInfoV1,
 };
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
@@ -203,6 +206,20 @@ impl ApiError {
             message: "Delivery is currently unavailable.",
         }
     }
+    fn version_conflict() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "version_conflict",
+            message: "The stored state moved; re-read and retry.",
+        }
+    }
+    fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: "No matching resource.",
+        }
+    }
     fn internal(error: impl std::fmt::Display) -> Self {
         error!(error = %error, "mailbox operation failed");
         Self {
@@ -294,6 +311,17 @@ pub fn router(state: AppState) -> Router {
             "/v1/mailbox/read-capability/rotate",
             post(rotate_read_capability),
         )
+        .route(
+            "/v1/mailbox/mls-state",
+            get(get_mls_state).put(put_mls_state),
+        )
+        .route(
+            "/v1/mailbox/devices",
+            get(list_devices).post(register_device),
+        )
+        .route("/v1/mailbox/devices/{device_id}", delete(revoke_device))
+        .route("/v1/enroll/parcels", post(park_enrollment_parcel))
+        .route("/v1/enroll/parcels/claim", post(claim_enrollment_parcel))
         .route("/v1/deposit/key-packages/claim", post(claim_key_package))
         .route("/v1/deposit/envelopes", post(deposit_envelope))
         .route("/v1/mailbox/pull", post(pull_envelopes))
@@ -317,7 +345,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 fn cors_public_path(path: &str) -> bool {
     matches!(
         path,
-        "/v1/info" | "/v1/deposit/key-packages/claim" | "/v1/deposit/envelopes"
+        "/v1/info"
+            | "/v1/deposit/key-packages/claim"
+            | "/v1/deposit/envelopes"
+            | "/v1/enroll/parcels/claim"
     )
 }
 
@@ -540,6 +571,264 @@ async fn rotate_read_capability(
         .await
         .map_err(|error| map_conflict(error, "read_capability_conflict"))?;
     Ok(Json(RotateReadCapabilityResponseV1 { ok: true }))
+}
+
+/// Read the shared MLS-state blob. Admin-gated: the private ratchet must never be
+/// exposed to a read-capability holder. Returns 204 before the first device uploads.
+async fn get_mls_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let mailbox_id = authorize_mailbox(
+        &state.pool,
+        &headers,
+        "BlackspaceAdmin",
+        CapabilityKind::Admin,
+        "admin_capability_verifier",
+    )
+    .await?;
+    let row = sqlx::query(
+        "SELECT version, size_class, ciphertext FROM mls_state_blobs WHERE mailbox_id=$1",
+    )
+    .bind(mailbox_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    match row {
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+        Some(row) => Ok(Json(MlsStateResponseV1 {
+            version: row.get("version"),
+            size_class: row.get::<i32, _>("size_class") as usize,
+            ciphertext: URL_SAFE_NO_PAD.encode(row.get::<Vec<u8>, _>("ciphertext")),
+        })
+        .into_response()),
+    }
+}
+
+/// Compare-and-swap write of the shared MLS-state blob. Succeeds only when
+/// `expected_version` matches the stored version (0 for the first write); otherwise
+/// 409. This is the cross-device guard that makes a ratchet fork impossible.
+async fn put_mls_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PutMlsStateRequestV1>,
+) -> Result<Json<PutMlsStateResponseV1>, ApiError> {
+    let mailbox_id = authorize_mailbox(
+        &state.pool,
+        &headers,
+        "BlackspaceAdmin",
+        CapabilityKind::Admin,
+        "admin_capability_verifier",
+    )
+    .await?;
+    if request.expected_version < 0 {
+        return Err(ApiError::invalid_request());
+    }
+    let ciphertext = validate_sized_ciphertext(
+        &request.ciphertext,
+        request.size_class,
+        &MLS_STATE_SIZE_CLASSES,
+    )?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let current: Option<i64> =
+        sqlx::query_scalar("SELECT version FROM mls_state_blobs WHERE mailbox_id=$1 FOR UPDATE")
+            .bind(mailbox_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+    let next = cas_next_version(current, request.expected_version)
+        .ok_or_else(ApiError::version_conflict)?;
+    sqlx::query(
+        "INSERT INTO mls_state_blobs (mailbox_id, version, size_class, ciphertext, updated_at)
+         VALUES ($1,$2,$3,$4,now())
+         ON CONFLICT (mailbox_id)
+         DO UPDATE SET version=$2, size_class=$3, ciphertext=$4, updated_at=now()",
+    )
+    .bind(mailbox_id)
+    .bind(next)
+    .bind(request.size_class as i32)
+    .bind(ciphertext)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(PutMlsStateResponseV1 { version: next }))
+}
+
+/// Park a one-time enrollment parcel for a new device. Admin-gated (only an already
+/// enrolled device enrolls another). The ciphertext is sealed to the new device's
+/// ephemeral key; the server stores opaque bytes.
+async fn park_enrollment_parcel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ParkEnrollmentParcelRequestV1>,
+) -> Result<(StatusCode, Json<ParkEnrollmentParcelResponseV1>), ApiError> {
+    let mailbox_id = authorize_mailbox(
+        &state.pool,
+        &headers,
+        "BlackspaceAdmin",
+        CapabilityKind::Admin,
+        "admin_capability_verifier",
+    )
+    .await?;
+    let verifier =
+        decode_verifier(&request.parcel_verifier).map_err(|_| ApiError::invalid_request())?;
+    let ciphertext =
+        validate_sized_ciphertext(&request.ciphertext, request.size_class, &SIZE_CLASSES)?;
+    if request.eph_pub.len() > 128
+        || request.nonce.len() > 64
+        || URL_SAFE_NO_PAD.decode(&request.eph_pub).is_err()
+        || URL_SAFE_NO_PAD.decode(&request.nonce).is_err()
+    {
+        return Err(ApiError::invalid_request());
+    }
+    let expires_at = OffsetDateTime::from_unix_timestamp(request.expires_at)
+        .map_err(|_| ApiError::invalid_request())?;
+    let now = OffsetDateTime::now_utc();
+    if expires_at <= now || expires_at > now + time::Duration::hours(24) {
+        return Err(ApiError::invalid_request());
+    }
+    let parcel_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO enrollment_parcels (id, mailbox_id, verifier, eph_pub, nonce, size_class, ciphertext, expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+    )
+    .bind(parcel_id)
+    .bind(mailbox_id)
+    .bind(verifier.as_slice())
+    .bind(&request.eph_pub)
+    .bind(&request.nonce)
+    .bind(request.size_class as i32)
+    .bind(ciphertext)
+    .bind(expires_at)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| map_conflict(error, "parcel_conflict"))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ParkEnrollmentParcelResponseV1 { parcel_id }),
+    ))
+}
+
+/// Claim an enrollment parcel once, authenticated by the bearer secret carried in
+/// the enrollment QR. Public-CORS so a fresh web device can reach it.
+async fn claim_enrollment_parcel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ClaimEnrollmentParcelResponseV1>, ApiError> {
+    let raw = authorization_capability(&headers, "BlackspaceEnroll")?;
+    let digest = verifier(CapabilityKind::Enroll, raw).map_err(|_| ApiError::not_found())?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let row = sqlx::query(
+        "SELECT id, eph_pub, nonce, size_class, ciphertext FROM enrollment_parcels
+         WHERE verifier=$1 AND claimed_at IS NULL AND expires_at > now()
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(digest.as_slice())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(ApiError::not_found)?;
+    let parcel_id: Uuid = row.get("id");
+    sqlx::query("UPDATE enrollment_parcels SET claimed_at=now() WHERE id=$1")
+        .bind(parcel_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(ClaimEnrollmentParcelResponseV1 {
+        eph_pub: row.get("eph_pub"),
+        nonce: row.get("nonce"),
+        size_class: row.get::<i32, _>("size_class") as usize,
+        ciphertext: URL_SAFE_NO_PAD.encode(row.get::<Vec<u8>, _>("ciphertext")),
+    }))
+}
+
+async fn register_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterDeviceRequestV1>,
+) -> Result<StatusCode, ApiError> {
+    let mailbox_id = authorize_mailbox(
+        &state.pool,
+        &headers,
+        "BlackspaceAdmin",
+        CapabilityKind::Admin,
+        "admin_capability_verifier",
+    )
+    .await?;
+    if request.label.is_empty() || request.label.len() > 128 {
+        return Err(ApiError::invalid_request());
+    }
+    sqlx::query(
+        "INSERT INTO mailbox_devices (id, mailbox_id, label) VALUES ($1,$2,$3)
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(request.device_id)
+    .bind(mailbox_id)
+    .bind(&request.label)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn list_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ListDevicesResponseV1>, ApiError> {
+    let mailbox_id = authorize_mailbox(
+        &state.pool,
+        &headers,
+        "BlackspaceAdmin",
+        CapabilityKind::Admin,
+        "admin_capability_verifier",
+    )
+    .await?;
+    let rows = sqlx::query(
+        "SELECT id, label, extract(epoch from enrolled_at)::bigint AS enrolled_at, revoked_at
+         FROM mailbox_devices WHERE mailbox_id=$1 ORDER BY enrolled_at",
+    )
+    .bind(mailbox_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(Json(ListDevicesResponseV1 {
+        devices: rows
+            .into_iter()
+            .map(|row| DeviceV1 {
+                id: row.get("id"),
+                label: row.get("label"),
+                enrolled_at: row.get("enrolled_at"),
+                revoked: row.get::<Option<OffsetDateTime>, _>("revoked_at").is_some(),
+            })
+            .collect(),
+    }))
+}
+
+/// Mark a device revoked in the registry. Surgical secret re-keying is a follow-up;
+/// the secure panic button today is rotating the read capability (all devices
+/// re-enroll). Kept admin-gated and idempotent.
+async fn revoke_device(
+    State(state): State<AppState>,
+    Path(device_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let mailbox_id = authorize_mailbox(
+        &state.pool,
+        &headers,
+        "BlackspaceAdmin",
+        CapabilityKind::Admin,
+        "admin_capability_verifier",
+    )
+    .await?;
+    sqlx::query("UPDATE mailbox_devices SET revoked_at=now() WHERE id=$1 AND mailbox_id=$2 AND revoked_at IS NULL")
+        .bind(device_id)
+        .bind(mailbox_id)
+        .execute(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn publish_key_packages(
@@ -912,17 +1201,41 @@ fn key_package_from_row(row: &sqlx::postgres::PgRow) -> KeyPackageV1 {
 }
 
 fn validate_envelope(envelope: &EnvelopeV1) -> Result<Vec<u8>, ApiError> {
-    if envelope.version != 1 || !SIZE_CLASSES.contains(&envelope.size_class) {
+    if envelope.version != 1 {
         return Err(ApiError::invalid_request());
     }
     let now = OffsetDateTime::now_utc().unix_timestamp();
     if envelope.expires_at <= now || envelope.expires_at > now + MAX_RETENTION_SECONDS {
         return Err(ApiError::invalid_request());
     }
+    validate_sized_ciphertext(&envelope.ciphertext, envelope.size_class, &SIZE_CLASSES)
+}
+
+/// Compare-and-swap decision for the shared MLS-state version. Returns the version
+/// to store when `expected` matches the current state (absent state matches 0), or
+/// `None` when the caller raced another device and must re-read.
+fn cas_next_version(current: Option<i64>, expected: i64) -> Option<i64> {
+    if current.unwrap_or(0) == expected {
+        Some(expected + 1)
+    } else {
+        None
+    }
+}
+
+/// Decode a base64url ciphertext and enforce that its exact length equals a declared,
+/// allowed size class (fixed-size padding is what denies the server length metadata).
+fn validate_sized_ciphertext(
+    ciphertext: &str,
+    size_class: usize,
+    allowed: &[usize],
+) -> Result<Vec<u8>, ApiError> {
+    if !allowed.contains(&size_class) {
+        return Err(ApiError::invalid_request());
+    }
     let bytes = URL_SAFE_NO_PAD
-        .decode(&envelope.ciphertext)
+        .decode(ciphertext)
         .map_err(|_| ApiError::invalid_request())?;
-    if bytes.len() != envelope.size_class || URL_SAFE_NO_PAD.encode(&bytes) != envelope.ciphertext {
+    if bytes.len() != size_class || URL_SAFE_NO_PAD.encode(&bytes) != ciphertext {
         return Err(ApiError::invalid_request());
     }
     Ok(bytes)
@@ -973,6 +1286,7 @@ fn spawn_expiry_cleanup(pool: PgPool) {
                 "DELETE FROM envelopes WHERE expires_at<=now()",
                 "DELETE FROM key_packages WHERE expires_at<=now() OR claimed_at < now() - interval '24 hours'",
                 "DELETE FROM registration_invitations WHERE expires_at < now() - interval '24 hours'",
+                "DELETE FROM enrollment_parcels WHERE expires_at < now() OR claimed_at < now() - interval '1 hour'",
             ] {
                 if let Err(error) = sqlx::query(statement).execute(&pool).await {
                     error!(error=%error, "expiry cleanup failed");
@@ -1034,6 +1348,33 @@ mod tests {
             assert!(limiter.allow([4_u8; 32]));
         }
         assert!(!limiter.allow([4_u8; 32]));
+    }
+
+    #[test]
+    fn cas_accepts_matching_version_and_rejects_races() {
+        // First write: no stored state, expected 0 -> store version 1.
+        assert_eq!(cas_next_version(None, 0), Some(1));
+        // Matching expected version advances by one.
+        assert_eq!(cas_next_version(Some(4), 4), Some(5));
+        // A stale expected version (another device already committed) is rejected.
+        assert_eq!(cas_next_version(Some(5), 4), None);
+        // A first write that wrongly assumes existing state is rejected.
+        assert_eq!(cas_next_version(None, 3), None);
+    }
+
+    #[test]
+    fn sized_ciphertext_requires_exact_declared_class() {
+        let padded = URL_SAFE_NO_PAD.encode([9_u8; 4096]);
+        assert_eq!(
+            validate_sized_ciphertext(&padded, 4096, &MLS_STATE_SIZE_CLASSES)
+                .unwrap()
+                .len(),
+            4096
+        );
+        // Declared class not in the allowed set.
+        assert!(validate_sized_ciphertext(&padded, 4096, &SIZE_CLASSES[..1]).is_err());
+        // Actual length disagrees with the declared class.
+        assert!(validate_sized_ciphertext(&padded, 16_384, &MLS_STATE_SIZE_CLASSES).is_err());
     }
 
     #[test]

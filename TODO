@@ -1,3 +1,10 @@
 [X] Fix so that HTTPS Web PWA can send messages to TOR devices.
 [X] Abunch of 401 errors on HTTPS web PWA
 [X] QR Code works
+[ ] Shrink the pairing payload
+[ ] Live camera scanning for QR code detection
+[ ] Multible paired devices
+[ ] Attachments/images
+[ ] Notifications
+[ ] Disappearing messages / retention policy
+[ ] Add a MIT licence

@@ -17,11 +17,22 @@ export const fromBase64Url = (value: string): Uint8Array => {
   return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
 };
 
-export function randomCapability(): string {
-  return base64Url(crypto.getRandomValues(new Uint8Array(32)));
+// Web Crypto limits each getRandomValues call to 65,536 bytes. Fill larger
+// padding buffers in-place in bounded chunks without changing their entropy.
+export function randomBytes(length: number): Uint8Array {
+  if (!Number.isSafeInteger(length) || length < 0) throw new Error("Random byte length is invalid.");
+  const bytes = new Uint8Array(length);
+  for (let offset = 0; offset < bytes.length; offset += 65_536) {
+    crypto.getRandomValues(bytes.subarray(offset, Math.min(offset + 65_536, bytes.length)));
+  }
+  return bytes;
 }
 
-export async function capabilityVerifier(kind: "read" | "admin" | "deposit", capability: string): Promise<string> {
+export function randomCapability(): string {
+  return base64Url(randomBytes(32));
+}
+
+export async function capabilityVerifier(kind: "read" | "admin" | "deposit" | "enroll", capability: string): Promise<string> {
   const domain = new TextEncoder().encode(`blackspace:v1:${kind}:`);
   const raw = fromBase64Url(capability);
   const input = new Uint8Array(domain.length + raw.length);
@@ -114,7 +125,7 @@ export function envelopeForPacket(packet: OpaquePacket): { version: number; enve
   const payload = new TextEncoder().encode(JSON.stringify(packet));
   const sizeClass = [1024, 4096, 16384, 65536, 262144].find((size) => size >= payload.length + 4);
   if (!sizeClass) throw new Error("The encrypted message is too large.");
-  const padded = crypto.getRandomValues(new Uint8Array(sizeClass));
+  const padded = randomBytes(sizeClass);
   new DataView(padded.buffer).setUint32(0, payload.length);
   padded.set(payload, 4);
   return { version: 1, envelope_id: crypto.randomUUID(), expires_at: Math.floor(Date.now() / 1000) + 14 * 24 * 60 * 60, size_class: sizeClass, ciphertext: base64Url(padded) };

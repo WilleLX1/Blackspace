@@ -131,3 +131,78 @@ export async function acknowledgeEnvelopes(origin: string, readCapability: strin
     method: "POST", headers: { "content-type": "application/json", authorization: `BlackspaceRead ${readCapability}` }, body: JSON.stringify({ acknowledgement_tokens: tokens }),
   });
 }
+
+// ---- Multi-device (floating primary) ----
+
+export interface SealedStateResponse { version: number; size_class: number; ciphertext: string }
+
+// Reads the shared MLS-state blob. 204 (no blob uploaded yet) returns undefined.
+export async function getMlsState(origin: string, adminCapability: string): Promise<SealedStateResponse | undefined> {
+  if (isTauri()) return (await invoke<SealedStateResponse | null>("get_mls_state", { serverUrl: origin, adminCapability })) ?? undefined;
+  const response = await fetch(`${origin}/v1/mailbox/mls-state`, {
+    method: "GET", redirect: "error", credentials: "omit", cache: "no-store",
+    headers: { authorization: `BlackspaceAdmin ${adminCapability}` },
+  });
+  if (response.status === 204) return undefined;
+  if (!response.ok) throw new MailboxOperationError(response.status);
+  return JSON.parse(await response.text()) as SealedStateResponse;
+}
+
+// Compare-and-swap write. Returns "conflict" on 409 so the caller re-reads and retries.
+export async function putMlsState(origin: string, adminCapability: string, expectedVersion: number, sealed: { size_class: number; ciphertext: string }): Promise<{ version: number } | "conflict"> {
+  if (isTauri()) {
+    const result = await invoke<{ conflict: boolean; version?: number }>("put_mls_state", { serverUrl: origin, adminCapability, request: { expected_version: expectedVersion, size_class: sealed.size_class, ciphertext: sealed.ciphertext } });
+    if (result.conflict || result.version === undefined) return "conflict";
+    return { version: result.version };
+  }
+  const response = await fetch(`${origin}/v1/mailbox/mls-state`, {
+    method: "PUT", redirect: "error", credentials: "omit", cache: "no-store",
+    headers: { "content-type": "application/json", authorization: `BlackspaceAdmin ${adminCapability}` },
+    body: JSON.stringify({ expected_version: expectedVersion, size_class: sealed.size_class, ciphertext: sealed.ciphertext }),
+  });
+  if (response.status === 409) return "conflict";
+  if (!response.ok) throw new MailboxOperationError(response.status);
+  return JSON.parse(await response.text()) as { version: number };
+}
+
+export async function parkEnrollmentParcel(origin: string, adminCapability: string, parcel: object): Promise<{ parcel_id: string }> {
+  if (isTauri()) return invoke("park_enrollment_parcel", { serverUrl: origin, adminCapability, request: parcel });
+  return jsonRequest(origin, "/v1/enroll/parcels", {
+    method: "POST", headers: { "content-type": "application/json", authorization: `BlackspaceAdmin ${adminCapability}` }, body: JSON.stringify(parcel),
+  });
+}
+
+export async function claimEnrollmentParcel(origin: string, claimSecret: string): Promise<{ eph_pub: string; nonce: string; size_class: number; ciphertext: string } | undefined> {
+  if (isTauri()) return (await invoke<{ eph_pub: string; nonce: string; size_class: number; ciphertext: string } | null>("claim_enrollment_parcel", { serverUrl: origin, claimSecret })) ?? undefined;
+  const response = await fetch(`${origin}/v1/enroll/parcels/claim`, {
+    method: "POST", redirect: "error", credentials: "omit", cache: "no-store",
+    headers: { authorization: `BlackspaceEnroll ${claimSecret}` },
+  });
+  if (response.status === 404) return undefined;
+  if (!response.ok) throw new MailboxOperationError(response.status);
+  return JSON.parse(await response.text()) as { eph_pub: string; nonce: string; size_class: number; ciphertext: string };
+}
+
+export async function registerDevice(origin: string, adminCapability: string, deviceId: string, label: string): Promise<void> {
+  if (isTauri()) { await invoke("register_device", { serverUrl: origin, adminCapability, request: { device_id: deviceId, label } }); return; }
+  await noContentRequest(origin, "/v1/mailbox/devices", {
+    method: "POST", headers: { "content-type": "application/json", authorization: `BlackspaceAdmin ${adminCapability}` }, body: JSON.stringify({ device_id: deviceId, label }),
+  });
+}
+
+export interface DeviceRecord { id: string; label: string; enrolled_at: number; revoked: boolean }
+
+export async function listDevices(origin: string, adminCapability: string): Promise<DeviceRecord[]> {
+  if (isTauri()) return (await invoke<{ devices: DeviceRecord[] }>("list_devices", { serverUrl: origin, adminCapability })).devices;
+  const response = await jsonRequest<{ devices: DeviceRecord[] }>(origin, "/v1/mailbox/devices", {
+    method: "GET", headers: { authorization: `BlackspaceAdmin ${adminCapability}` },
+  });
+  return response.devices;
+}
+
+export async function revokeDevice(origin: string, adminCapability: string, deviceId: string): Promise<void> {
+  if (isTauri()) { await invoke("revoke_device", { serverUrl: origin, adminCapability, deviceId }); return; }
+  await noContentRequest(origin, `/v1/mailbox/devices/${encodeURIComponent(deviceId)}`, {
+    method: "DELETE", headers: { authorization: `BlackspaceAdmin ${adminCapability}` },
+  });
+}

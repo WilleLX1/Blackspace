@@ -58,6 +58,16 @@ export interface AccountState {
   createdAt: number;
   companionLink?: CompanionLink;
   pendingReadCapability?: string;
+  // Floating-primary multi-device (plans/multi-device-floating.md). Present once an
+  // account has been upgraded to share its MLS state across devices:
+  //  - rootSecret derives the shared-state blob key (see account.ts);
+  //  - deviceId identifies this device in the mailbox registry;
+  //  - mlsStateVersion is the highest shared-state version this device has committed,
+  //    used to reject a server that rolls the blob backwards.
+  // Absent on legacy single-device accounts until first upgrade.
+  rootSecret?: string;
+  deviceId?: string;
+  mlsStateVersion?: number;
 }
 
 // Primary-side record of the single linked companion device (MVP: N=1).
@@ -154,6 +164,8 @@ export interface ServerInfo {
     registration_invites: boolean;
     recovery_takeover: boolean;
     companion_linking: boolean;
+    // Optional so an older server's /v1/info (without the field) still parses.
+    multi_device?: boolean;
   };
 }
 

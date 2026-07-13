@@ -6,9 +6,10 @@ import {
 } from "lucide-react";
 import QRCode from "qrcode";
 import {
-  acknowledgeEnvelopes, claimKeyPackage, createDepositCapability, depositEnvelope,
-  ownOrigin, provisionMailbox, publishKeyPackages, pullEnvelopes, revokeDepositCapability, serverInfo,
-  recoverMailbox, rotateReadCapability,
+  acknowledgeEnvelopes, claimEnrollmentParcel, claimKeyPackage, createDepositCapability, depositEnvelope,
+  getMlsState, listDevices, ownOrigin, parkEnrollmentParcel, provisionMailbox, publishKeyPackages, pullEnvelopes,
+  putMlsState, registerDevice, revokeDepositCapability, revokeDevice, serverInfo,
+  recoverMailbox, rotateReadCapability, type DeviceRecord,
 } from "./api";
 import {
   capabilityVerifier, envelopeForPacket,
@@ -28,11 +29,18 @@ import { detectTransportMode, deriveTransportMode, modeLabel, validateServerUrl 
 import { createRecoveryKit, deleteVault, lockVault, openRecoveryKit, saveVault, unlockVault, vaultExists } from "./vault";
 import { pairingQrImage, scanQr } from "./qr";
 import { createSerialRunner } from "./serial";
+import {
+  createEnrollmentOffer, openEnrollmentParcel, openMlsState, parseEnrollmentOffer, randomRootSecret,
+  sealEnrollmentParcel, sealMlsState, type EnrollmentBundle, type EnrollmentOffer,
+} from "./account";
+import { RollbackError, serverTransport, withMlsState } from "./mlsstate";
+import { applyShared, extractShared, parseShared, serializeShared, type SharedState } from "./sharedstate";
 
 type Screen = "loading" | "welcome" | "locked" | "messenger";
-type Dialog = "add" | "invite" | "settings" | "security" | "link" | null;
+type Dialog = "add" | "invite" | "settings" | "security" | "link" | "device" | null;
 
 const initials = (name: string) => name.split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("") || "?";
+const deviceLabel = () => (navigator.userAgent.includes("Mobile") ? "Phone" : "Browser");
 const formatTime = (value: number) => new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(value);
 const formatDay = (value: number) => new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(value);
 const wirePackages = (packages: string[], identity: string): KeyPackageWire[] => {
@@ -67,6 +75,7 @@ function WelcomeScreen({ onComplete }: { onComplete(state: StoredAccount, passph
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [linking, setLinking] = useState(false);
+  const [enrolling, setEnrolling] = useState(false);
   const recoveryInput = useRef<HTMLInputElement>(null);
   const attempt = useRef<{
     key: string;
@@ -174,6 +183,7 @@ function WelcomeScreen({ onComplete }: { onComplete(state: StoredAccount, passph
     finally { setBusy(false); if (recoveryInput.current) recoveryInput.current.value = ""; }
   };
 
+  if (enrolling) return <EnrollDeviceScreen onComplete={onComplete} onCancel={() => setEnrolling(false)} />;
   if (linking) return <LinkCompanionScreen onComplete={onComplete} onCancel={() => setLinking(false)} />;
   return <main className="auth-shell">
     <section className="auth-brand">
@@ -192,7 +202,8 @@ function WelcomeScreen({ onComplete }: { onComplete(state: StoredAccount, passph
       <button className="primary wide" onClick={create} disabled={busy}>{busy ? <><RefreshCw className="spin" /> Creating encrypted identity…</> : <>Create my private space <Send size={17} /></>}</button>
       <input ref={recoveryInput} hidden type="file" accept=".blackspace-recovery,application/blackspace-recovery" onChange={(event) => void recover(event.target.files?.[0])} />
       <button className="text-button" onClick={() => recoveryInput.current?.click()} disabled={busy}><Archive size={15} /> Recover this device</button>
-      <button className="text-button" onClick={() => setLinking(true)} disabled={busy}><Users size={15} /> Link to an existing account</button>
+      <button className="text-button" onClick={() => setEnrolling(true)} disabled={busy}><Users size={15} /> Add this device to my account</button>
+      <button className="text-button" onClick={() => setLinking(true)} disabled={busy}><Users size={15} /> Link as a companion (mirror)</button>
       <p className="fine-print">Unaudited private alpha. Do not use for high-risk communications.</p>
       <ModeBadge />
     </section>
@@ -236,6 +247,96 @@ function LinkCompanionScreen({ onComplete, onCancel }: { onComplete(state: Compa
   return <main className="lock-shell"><section className="lock-card"><span className="eyebrow">LINKED COMPANION</span><h1>Link this device</h1><p>Show this first code to your primary device. It contains only a temporary public key.</p>{offerQr && <img className="pairing-qr" src={offerQr} alt="Companion pairing offer" />}<textarea readOnly rows={4} value={offer?.qr ?? "Preparing…"} />{!opened ? <><label>Response from primary<textarea rows={5} value={response} onChange={(event) => setResponse(event.target.value)} /></label><input ref={responseImage} hidden type="file" accept="image/*" capture="environment" onChange={(event) => void scanResponse(event.target.files?.[0])} /><button className="secondary wide" onClick={() => responseImage.current?.click()}><Hash size={16} /> Scan response QR</button><button className="primary wide" onClick={inspect} disabled={!response.trim()}>Open response</button></> : <><p>Compare this code on both devices before confirming:</p><code>{opened.sas}</code><label>Local vault passphrase<input type="password" value={passphrase} onChange={(event) => setPassphrase(event.target.value)} /></label><label>Confirm passphrase<input type="password" value={confirm} onChange={(event) => setConfirm(event.target.value)} /></label><button className="primary wide" onClick={finish}>Codes match — link device</button></>}{error && <p className="form-error"><CircleAlert size={16} />{error}</p>}<button className="text-button" onClick={onCancel}>Cancel</button></section></main>;
 }
 
+// New-device onboarding for multi-device: show one enrollment QR, wait for the
+// trusted device to seal a parcel, confirm the emoji, then bootstrap the full
+// account from the shared state blob. One scan (of this screen) plus one tap.
+function EnrollDeviceScreen({ onComplete, onCancel }: { onComplete(state: StoredAccount, passphrase: string): void; onCancel(): void }) {
+  const [onion, setOnion] = useState("");
+  const [https, setHttps] = useState("");
+  const [session, setSession] = useState<{ offer: EnrollmentOffer; origin: string; image: string }>();
+  const [claimed, setClaimed] = useState<{ bundle: EnrollmentBundle; sas: string }>();
+  const [passphrase, setPassphrase] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const start = async () => {
+    setError(""); setBusy(true);
+    try {
+      const onionOrigin = onion.trim();
+      const httpsOrigin = https.trim() || undefined;
+      const origin = ownOrigin(onionOrigin, httpsOrigin);
+      const offer = await createEnrollmentOffer(onionOrigin, httpsOrigin);
+      setSession({ offer, origin, image: await pairingQrImage(offer.qr) });
+    } catch (cause) { setError(errorMessage(cause, "Enter your server's onion address from the other device's Settings.")); }
+    finally { setBusy(false); }
+  };
+
+  useEffect(() => {
+    if (!session || claimed) return;
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const parcel = await claimEnrollmentParcel(session.origin, session.offer.claimSecret);
+          if (!parcel || cancelled) return;
+          const opened = await openEnrollmentParcel(session.offer, parcel);
+          if (cancelled) return;
+          window.clearInterval(timer);
+          setClaimed(opened);
+        } catch { /* keep polling until the parcel appears */ }
+      })();
+    }, 2_500);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [session, claimed]);
+
+  const finish = async () => {
+    if (!session || !claimed) return;
+    setError(""); setBusy(true);
+    try {
+      if (passphrase.length < 10 || passphrase !== confirm) throw new Error("Use a matching local passphrase of at least 10 characters.");
+      const bundle = claimed.bundle;
+      const sealed = await getMlsState(session.origin, bundle.adminCapability);
+      if (!sealed) throw new Error("The account has no shared state yet. Open your other device once, then retry.");
+      const shared = parseShared(await openMlsState(bundle.rootSecret, bundle.mailboxId, sealed));
+      const state: AccountState = {
+        version: 1, displayName: bundle.displayName, instanceName: bundle.instanceName,
+        mailboxId: bundle.mailboxId, onionOrigin: bundle.onionOrigin, httpsOrigin: bundle.httpsOrigin,
+        readCapability: bundle.readCapability, adminCapability: bundle.adminCapability, identityPublicKey: bundle.identityPublicKey,
+        mlsClientState: shared.mlsClientState, availableKeyPackages: shared.availableKeyPackages,
+        contacts: shared.contacts.map((contact) => ({ ...contact, draft: "" })), messages: shared.messages, createdAt: Date.now(),
+        rootSecret: bundle.rootSecret, deviceId: bundle.deviceId, mlsStateVersion: sealed.version,
+      };
+      await saveVault(state, passphrase);
+      onComplete(state, passphrase);
+    } catch (cause) { setError(errorMessage(cause, "Could not finish adding this device.")); }
+    finally { setBusy(false); }
+  };
+
+  return <main className="lock-shell"><section className="lock-card">
+    <span className="eyebrow">ADD THIS DEVICE</span><h1>Add to your account</h1>
+    {!session ? <>
+      <p>Enter your Blackspace server address (shown under Settings → Identity on a device that is already signed in).</p>
+      <label>Server onion address<input value={onion} onChange={(event) => setOnion(event.target.value)} placeholder="http://…onion" /></label>
+      <label>HTTPS gateway (optional)<input value={https} onChange={(event) => setHttps(event.target.value)} placeholder="https://…" /></label>
+      <button className="primary wide" onClick={start} disabled={busy || !onion.trim()}>Show enrollment code</button>
+    </> : !claimed ? <>
+      <p>On your other device, open Settings → Devices → Add a device and scan this code.</p>
+      {session.image && <img className="pairing-qr" src={session.image} alt="Device enrollment code" />}
+      <textarea readOnly rows={3} value={session.offer.qr} />
+      <p className="fine-print">Waiting for your other device to confirm…</p>
+    </> : <>
+      <p>Confirm this emoji code matches the one shown on your other device:</p>
+      <code>{claimed.sas}</code>
+      <label>Local vault passphrase<input type="password" value={passphrase} onChange={(event) => setPassphrase(event.target.value)} /></label>
+      <label>Confirm passphrase<input type="password" value={confirm} onChange={(event) => setConfirm(event.target.value)} /></label>
+      <button className="primary wide" onClick={finish} disabled={busy}>Codes match — add device</button>
+    </>}
+    {error && <p className="form-error"><CircleAlert size={16} />{error}</p>}
+    <button className="text-button" onClick={onCancel}>Cancel</button>
+  </section></main>;
+}
+
 function LockedScreen({ onUnlock, onReset }: { onUnlock(state: StoredAccount, passphrase: string): void; onReset(): void }) {
   const [passphrase, setPassphrase] = useState("");
   const [error, setError] = useState("");
@@ -273,6 +374,8 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   const [inviteQr, setInviteQr] = useState("");
   const [busy, setBusy] = useState(false);
   const [linkSetup, setLinkSetup] = useState<{ pairingId: string; qr: string; qrImage: string; sas: string; linkSecret: string; downlinkCap: string; downlinkCapId: string; uplinkCapId: string }>();
+  const [addDeviceSas, setAddDeviceSas] = useState("");
+  const [devices, setDevices] = useState<DeviceRecord[]>([]);
   const syncing = useRef(false);
   const syncFailures = useRef(0);
   const resumedPendingRotation = useRef(false);
@@ -281,6 +384,8 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   const persist = useCallback(async (next: AccountState) => {
     accountRef.current = next; setAccount(next); await saveVault(next, passphrase);
   }, [passphrase]);
+
+  const ownServer = ownOrigin(account.onionOrigin, account.httpsOrigin);
 
   // Serialize every clone→mutate→persist cycle (poll processing, sends, accepts,
   // retries, mirror snapshots, one-field edits) through one runner so they never
@@ -300,7 +405,89 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     outbox.push(envelopeForPacket(packet)); await persist(next);
   }), [persist, runExclusive]);
 
-  const ownServer = ownOrigin(account.onionOrigin, account.httpsOrigin);
+  // The single choke point for every conversation-state change. When this device
+  // has been upgraded to multi-device, the authoritative state is the shared,
+  // encrypted CAS blob on the server: download it, run `op` against it, and
+  // compare-and-swap it back (withMlsState), so concurrent devices never fork the
+  // ratchet and every device converges on one history. Before upgrade it behaves
+  // exactly as before — a purely local read-modify-write on the vault. Callers
+  // must already hold the in-process lock (runExclusive); `op` mutates the given
+  // SharedState in place, and any network side effect (deposit/ack) goes in
+  // `deferred`, which runs only after the state it depends on has committed.
+  const mutateState = useCallback(async <T,>(op: (shared: SharedState) => Promise<{ changed: boolean; value: T; deferred?: () => Promise<void> }>): Promise<T> => {
+    const base = accountRef.current;
+    if (base.rootSecret !== undefined && base.mlsStateVersion !== undefined) {
+      const transport = serverTransport(ownServer, base.adminCapability, getMlsState, putMlsState);
+      const outcome = await withMlsState(
+        { transport, rootSecret: base.rootSecret, mailboxId: base.mailboxId, knownVersion: base.mlsStateVersion },
+        async (stateStr) => {
+          const shared = stateStr ? parseShared(stateStr) : extractShared(accountRef.current);
+          const result = await op(shared);
+          return { changed: result.changed, state: result.changed ? serializeShared(shared) : undefined, deferred: result.deferred, result: { shared, value: result.value } };
+        },
+      );
+      const merged = applyShared(accountRef.current, outcome.result.shared);
+      merged.mlsStateVersion = outcome.version;
+      await persist(merged);
+      return outcome.result.value;
+    }
+    // Legacy single-device: no server blob, operate on the local vault directly.
+    const shared = extractShared(accountRef.current);
+    const result = await op(shared);
+    if (result.changed) await persist(applyShared(accountRef.current, shared));
+    if (result.deferred) await result.deferred();
+    return result.value;
+  }, [ownServer, persist]);
+
+  // Opt-in migration of a legacy single-device account to multi-device: mint a
+  // root secret, publish the current state as blob version 1, and register this
+  // device. Guarded so a mailbox that already has shared state is never clobbered.
+  const ensureUpgraded = useCallback((): Promise<void> => runExclusive(async () => {
+    const acct = accountRef.current;
+    if (acct.rootSecret !== undefined && acct.mlsStateVersion !== undefined) return;
+    if (await getMlsState(ownServer, acct.adminCapability)) {
+      throw new Error("This mailbox already has shared multi-device state. Enroll this device from one that is already linked.");
+    }
+    const rootSecret = randomRootSecret();
+    const deviceId = crypto.randomUUID();
+    const sealed = await sealMlsState(rootSecret, acct.mailboxId, serializeShared(extractShared(acct)));
+    const put = await putMlsState(ownServer, acct.adminCapability, 0, sealed);
+    if (put === "conflict") throw new Error("Another device just set up multi-device. Reload, then enroll this device.");
+    await registerDevice(ownServer, acct.adminCapability, deviceId, deviceLabel());
+    const next = structuredClone(accountRef.current);
+    next.rootSecret = rootSecret; next.deviceId = deviceId; next.mlsStateVersion = put.version;
+    await persist(next);
+  }), [ownServer, persist, runExclusive]);
+
+  // Trusted device: upgrade if needed, then seal the enrollment bundle to the new
+  // device's scanned key and park it. The SAS is shown for the human to compare.
+  const addDevice = useCallback(async (offerCode: string): Promise<void> => {
+    await ensureUpgraded();
+    const base = accountRef.current;
+    if (base.rootSecret === undefined) throw new Error("This device is not set up for multi-device.");
+    const offer = parseEnrollmentOffer(offerCode);
+    const deviceId = crypto.randomUUID();
+    const bundle: EnrollmentBundle = {
+      rootSecret: base.rootSecret, readCapability: base.readCapability, adminCapability: base.adminCapability,
+      identityPublicKey: base.identityPublicKey, mailboxId: base.mailboxId, onionOrigin: base.onionOrigin,
+      httpsOrigin: base.httpsOrigin, displayName: base.displayName, instanceName: base.instanceName, deviceId,
+    };
+    const { parcel, sas } = await sealEnrollmentParcel(offer, bundle);
+    await parkEnrollmentParcel(ownServer, base.adminCapability, parcel);
+    await registerDevice(ownServer, base.adminCapability, deviceId, deviceLabel());
+    setAddDeviceSas(sas);
+  }, [ensureUpgraded, ownServer]);
+
+  const refreshDevices = useCallback(async () => {
+    try { setDevices(await listDevices(ownServer, accountRef.current.adminCapability)); }
+    catch { setDevices([]); }
+  }, [ownServer]);
+
+  const removeDevice = useCallback(async (id: string) => {
+    await revokeDevice(ownServer, accountRef.current.adminCapability, id);
+    await refreshDevices();
+  }, [ownServer, refreshDevices]);
+
   const selected = account.contacts.find((contact) => contact.id === selectedId);
   const messages = account.messages.filter((message) => message.contactId === selectedId).sort((a, b) => a.sentAt - b.sentAt);
   const filtered = account.contacts.filter((contact) => contact.status !== "blocked" && (contact.localName ?? contact.displayName).toLowerCase().includes(search.toLowerCase()));
@@ -372,10 +559,134 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     await depositEnvelope(contact.target, envelopeForPacket({ kind: "mls", hint: await mlsGroupHint(contact.mlsGroupId), message: encrypted.message }));
   }, [persist]);
 
+  // Multi-device receive/send loop: every MLS operation runs against the shared
+  // CAS blob via mutateState. Structurally mirrors the legacy poll below, minus
+  // the companion downlink (multi-device and companion linking are exclusive).
+  const pollShared = useCallback(async () => {
+    const base = accountRef.current;
+    const readOrigin = ownOrigin(base.onionOrigin, base.httpsOrigin);
+
+    // 1. Drain the outbox: deposit queued envelopes (idempotent), then mark them
+    // accepted in the shared state. Reads from the local cache, which mirrors the
+    // last committed shared state.
+    await runExclusive(async () => {
+      const queued = accountRef.current.messages.filter((message) => message.direction === "outgoing" && message.delivery === "queued" && message.pendingEnvelope);
+      const deposited: string[] = [];
+      for (const message of queued) {
+        const contact = accountRef.current.contacts.find((item) => item.id === message.contactId);
+        if (!contact || !message.pendingEnvelope) continue;
+        try { await depositEnvelope(contact.target, message.pendingEnvelope); deposited.push(message.id); } catch { /* retried next poll */ }
+      }
+      if (deposited.length) {
+        await mutateState(async (shared) => {
+          for (const id of deposited) { const message = shared.messages.find((item) => item.id === id); if (message) { message.delivery = "server-accepted"; message.pendingEnvelope = undefined; } }
+          return { changed: true, value: undefined };
+        });
+      }
+    });
+
+    // 2. Receive: pull, process each inbound envelope through the shared ratchet,
+    // ack only after the resulting state commits.
+    const pulled = await pullEnvelopes(readOrigin, base.readCapability);
+    if (pulled.length) {
+      const receipts = await runExclusive(() => mutateState(async (shared) => {
+        const acknowledged: string[] = [];
+        const gathered: Array<{ contactId: string; messageId: string }> = [];
+        let changed = false;
+        for (const envelope of pulled) {
+          try {
+            const packet = packetFromEnvelope(envelope.ciphertext);
+            if (packet.kind === "mls_bootstrap") {
+              const opened = await mlsJoin(shared.mlsClientState, packet.welcome, packet.firstMessage);
+              const content = await decodeSecureContent(opened.first_payload);
+              if (content.senderIdentity !== opened.peer_identity || !content.replyInvitation) throw new Error("The MLS credential does not match the profile card.");
+              const reply = parseContactInvitation(content.replyInvitation);
+              if (reply.identityPublicKey !== opened.peer_identity) throw new Error("The reply identity does not match the MLS credential.");
+              shared.mlsClientState = opened.client_state;
+              shared.availableKeyPackages = Math.max(0, shared.availableKeyPackages - 1);
+              let contact = shared.contacts.find((item) => item.identityPublicKey === opened.peer_identity);
+              if (!contact) {
+                contact = { id: crypto.randomUUID(), identityPublicKey: opened.peer_identity, displayName: content.displayName ?? "New contact", status: "request", verified: false, unread: 1, target: { onion_url: reply.onionOrigin, https_url: reply.httpsOrigin, deposit_capability: reply.capability }, mlsGroupId: opened.group_id, inboundCapabilityId: envelope.deposit_capability_id, lastMessageAt: content.sentAt };
+                shared.contacts.push(contact);
+              } else {
+                contact.mlsGroupId = opened.group_id;
+                contact.target = { onion_url: reply.onionOrigin, https_url: reply.httpsOrigin, deposit_capability: reply.capability };
+                contact.inboundCapabilityId = envelope.deposit_capability_id;
+                if (content.displayName) contact.displayName = content.displayName.slice(0, 64);
+              }
+              if (content.body && !shared.messages.some((message) => message.id === content.messageId)) {
+                shared.messages.push({ id: content.messageId, contactId: contact.id, direction: "incoming", body: content.body, sentAt: content.sentAt, delivery: "delivered" });
+                gathered.push({ contactId: contact.id, messageId: content.messageId });
+              }
+              changed = true;
+            } else if (packet.kind === "mls") {
+              const hints = await Promise.all(shared.contacts.map(async (contact) => ({ contact, hint: contact.mlsGroupId ? await mlsGroupHint(contact.mlsGroupId) : "" })));
+              const contact = hints.find((item) => item.hint === packet.hint)?.contact;
+              if (!contact?.mlsGroupId) throw new Error("No local MLS group can decrypt this envelope.");
+              contact.inboundCapabilityId = envelope.deposit_capability_id;
+              const opened = await mlsProcessMessage(shared.mlsClientState, contact.mlsGroupId, packet.message);
+              const content = await decodeSecureContent(opened.payload);
+              if (content.senderIdentity !== contact.identityPublicKey) throw new Error("The sender identity does not match the MLS credential.");
+              shared.mlsClientState = opened.client_state;
+              if (content.type === "text" && content.body && !shared.messages.some((message) => message.id === content.messageId)) {
+                shared.messages.push({ id: content.messageId, contactId: contact.id, direction: "incoming", body: content.body, sentAt: content.sentAt, delivery: "delivered" });
+                contact.lastMessageAt = content.sentAt; if (contact.id !== selectedId) contact.unread += 1;
+                gathered.push({ contactId: contact.id, messageId: content.messageId });
+              } else if (content.type === "delivery_receipt") {
+                for (const id of content.deliveredIds ?? []) { const message = shared.messages.find((item) => item.id === id); if (message) message.delivery = "delivered"; }
+              } else if (content.type === "profile" && content.displayName) {
+                contact.displayName = content.displayName.slice(0, 64);
+                if (content.replyInvitation) { const reply = parseContactInvitation(content.replyInvitation); if (reply.identityPublicKey === contact.identityPublicKey) contact.target = { onion_url: reply.onionOrigin, https_url: reply.httpsOrigin, deposit_capability: reply.capability }; }
+              }
+              changed = true;
+            } else {
+              throw new Error("Legacy transport packets are not accepted by this private-alpha client.");
+            }
+            acknowledged.push(envelope.acknowledgement_token);
+          } catch {
+            acknowledged.push(envelope.acknowledgement_token);
+          }
+        }
+        const deferred = async () => { if (acknowledged.length) await acknowledgeEnvelopes(readOrigin, base.readCapability, acknowledged); };
+        return { changed, deferred, value: gathered };
+      }));
+
+      // 3. Send a delivery receipt per newly received message (each advances the
+      // ratchet, so each is its own committed mutation).
+      for (const receipt of receipts) {
+        await runExclusive(() => mutateState(async (shared) => {
+          const contact = shared.contacts.find((item) => item.id === receipt.contactId);
+          if (!contact?.mlsGroupId) return { changed: false, value: undefined };
+          const content: SecureContent = { version: 1, type: "delivery_receipt", messageId: crypto.randomUUID(), sentAt: Date.now(), senderIdentity: shared.identityPublicKey, deliveredIds: [receipt.messageId] };
+          const encrypted = await mlsCreateMessage(shared.mlsClientState, contact.mlsGroupId, await encodeSecureContent(content));
+          shared.mlsClientState = encrypted.client_state;
+          const envelope = envelopeForPacket({ kind: "mls", hint: await mlsGroupHint(contact.mlsGroupId), message: encrypted.message });
+          const target = { ...contact.target };
+          return { changed: true, deferred: async () => { await depositEnvelope(target, envelope).catch(() => undefined); }, value: undefined };
+        })).catch(() => undefined);
+      }
+    }
+
+    // 4. Replenish key packages when the pool runs low.
+    await runExclusive(() => mutateState(async (shared) => {
+      if (shared.availableKeyPackages >= 5) return { changed: false, value: undefined };
+      const generated = await mlsReplenish(shared.mlsClientState, 20 - shared.availableKeyPackages);
+      shared.mlsClientState = generated.client_state; shared.availableKeyPackages = 20;
+      const identity = shared.identityPublicKey;
+      const adminCapability = accountRef.current.adminCapability;
+      return { changed: true, deferred: async () => { await publishKeyPackages(readOrigin, adminCapability, wirePackages(generated.key_packages, identity)); }, value: undefined };
+    }));
+  }, [mutateState, runExclusive, selectedId]);
+
   const poll = useCallback(async () => {
     if (!navigator.onLine || syncing.current) return;
     syncing.current = true;
     try {
+      if (accountRef.current.rootSecret !== undefined && accountRef.current.mlsStateVersion !== undefined) {
+        await pollShared();
+        syncFailures.current = 0;
+        return;
+      }
       await runExclusive(async () => {
       let current = structuredClone(accountRef.current);
       if (current.companionLink?.active && current.companionLink.downlinkOutbox.length) {
@@ -529,13 +840,14 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
       if (navigator.onLine && syncFailures.current >= 3) setError(message);
     }
     finally { syncing.current = false; }
-  }, [persist, selectedId, sendReceipt, runExclusive]);
+  }, [persist, selectedId, sendReceipt, runExclusive, pollShared]);
 
   useEffect(() => { void poll(); const timer = window.setInterval(() => void poll(), 5_000); return () => clearInterval(timer); }, [poll]);
+  useEffect(() => { if (dialog === "settings") void refreshDevices(); }, [dialog, refreshDevices]);
 
   const selectContact = async (contact: ContactRecord) => {
     setSelectedId(contact.id); setMobileList(false);
-    if (contact.unread) await runExclusive(async () => { const next = structuredClone(accountRef.current); const match = next.contacts.find((item) => item.id === contact.id); if (match) match.unread = 0; await persist(next); });
+    if (contact.unread) await runExclusive(() => mutateState(async (shared) => { const match = shared.contacts.find((item) => item.id === contact.id); if (match) match.unread = 0; return { changed: Boolean(match), value: undefined }; }));
   };
 
   const makeInvite = async () => {
@@ -612,32 +924,31 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   const addContact = async (value: string, firstMessage: string) => {
     setBusy(true); setError("");
     try {
-      await runExclusive(async () => {
-        const base = accountRef.current;
-        const invite = parseContactInvitation(value);
-        if (base.contacts.some((contact) => contact.identityPublicKey === invite.identityPublicKey)) throw new Error("This contact is already in your Blackspace.");
-        const target: DepositTarget = { onion_url: invite.onionOrigin, https_url: invite.httpsOrigin, deposit_capability: invite.capability };
-        const claimed = await claimKeyPackage(target);
-        validateClaimedPackage(claimed, invite.identityPublicKey);
-        const returnCapability = randomCapability();
-        const returnGrant = await createDepositCapability(ownServer, base.adminCapability, await capabilityVerifier("deposit", returnCapability));
-        const replyInvitation = formatContactInvitation({ onion_url: base.onionOrigin, https_url: base.httpsOrigin, deposit_capability: returnCapability }, base.identityPublicKey, crypto.randomUUID());
-        const messageId = crypto.randomUUID();
-        const content: SecureContent = { version: 1, type: "profile", messageId, sentAt: Date.now(), senderIdentity: base.identityPublicKey, displayName: base.displayName, replyInvitation, body: firstMessage.trim() || "Hello — I added you on Blackspace." };
-        const bootstrap = await mlsStart(accountRef.current.mlsClientState, invite.identityPublicKey, claimed.key_package, await encodeSecureContent(content));
-        const contact: ContactRecord = { id: crypto.randomUUID(), identityPublicKey: invite.identityPublicKey, displayName: "New contact", status: "accepted", verified: false, unread: 0, draft: "", target, mlsGroupId: bootstrap.group_id, inboundCapabilityId: returnGrant.capability_id, lastMessageAt: content.sentAt };
+      const base = accountRef.current;
+      const invite = parseContactInvitation(value);
+      if (base.contacts.some((contact) => contact.identityPublicKey === invite.identityPublicKey)) throw new Error("This contact is already in your Blackspace.");
+      const target: DepositTarget = { onion_url: invite.onionOrigin, https_url: invite.httpsOrigin, deposit_capability: invite.capability };
+      // Capability minting and key-package claim don't touch shared MLS state, so
+      // they run outside the CAS; only the group bootstrap is inside it.
+      const claimed = await claimKeyPackage(target);
+      validateClaimedPackage(claimed, invite.identityPublicKey);
+      const returnCapability = randomCapability();
+      const returnGrant = await createDepositCapability(ownServer, base.adminCapability, await capabilityVerifier("deposit", returnCapability));
+      const replyInvitation = formatContactInvitation({ onion_url: base.onionOrigin, https_url: base.httpsOrigin, deposit_capability: returnCapability }, base.identityPublicKey, crypto.randomUUID());
+      const messageId = crypto.randomUUID();
+      const contactId = crypto.randomUUID();
+      await runExclusive(() => mutateState(async (shared) => {
+        const content: SecureContent = { version: 1, type: "profile", messageId, sentAt: Date.now(), senderIdentity: shared.identityPublicKey, displayName: shared.displayName, replyInvitation, body: firstMessage.trim() || "Hello — I added you on Blackspace." };
+        const bootstrap = await mlsStart(shared.mlsClientState, invite.identityPublicKey, claimed.key_package, await encodeSecureContent(content));
+        shared.mlsClientState = bootstrap.client_state;
         const pendingEnvelope = envelopeForPacket({ kind: "mls_bootstrap", welcome: bootstrap.welcome, firstMessage: bootstrap.first_message });
-        const next = structuredClone(accountRef.current); next.mlsClientState = bootstrap.client_state; next.contacts.push(contact); next.messages.push({ id: messageId, contactId: contact.id, direction: "outgoing", body: content.body!, sentAt: content.sentAt, delivery: "queued", pendingEnvelope });
-        await persist(next);
-        try {
-          await depositEnvelope(target, pendingEnvelope);
-          const sent = structuredClone(accountRef.current); const message = sent.messages.find((item) => item.id === messageId); if (message) { message.delivery = "server-accepted"; message.pendingEnvelope = undefined; } await persist(sent);
-        } catch (cause) {
-          const failed = structuredClone(accountRef.current); const message = failed.messages.find((item) => item.id === messageId); if (message) { message.delivery = navigator.onLine ? "failed" : "queued"; message.error = navigator.onLine ? errorMessage(cause, "Send failed") : undefined; } await persist(failed);
-        }
-        setSelectedId(contact.id); setDialog(null); setMobileList(false);
-      });
+        shared.contacts.push({ id: contactId, identityPublicKey: invite.identityPublicKey, displayName: "New contact", status: "accepted", verified: false, unread: 0, target, mlsGroupId: bootstrap.group_id, inboundCapabilityId: returnGrant.capability_id, lastMessageAt: content.sentAt });
+        shared.messages.push({ id: messageId, contactId, direction: "outgoing", body: content.body!, sentAt: content.sentAt, delivery: "queued", pendingEnvelope });
+        return { changed: true, value: undefined };
+      }));
+      setSelectedId(contactId); setDialog(null); setMobileList(false);
       await queueMirrorSnapshot();
+      void poll();
     } catch (cause) { setError(errorMessage(cause, "Could not add the contact.")); }
     finally { setBusy(false); }
   };
@@ -646,50 +957,56 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     if (!selected?.mlsGroupId || !selected.draft.trim()) return;
     const body = selected.draft.trim(); const messageId = crypto.randomUUID(); const sentAt = Date.now(); const contactId = selected.id;
     await runExclusive(async () => {
-      let next = structuredClone(accountRef.current); const contact = next.contacts.find((item) => item.id === contactId); if (!contact?.mlsGroupId) return; contact.draft = ""; contact.lastMessageAt = sentAt;
-      try {
-        const content: SecureContent = { version: 1, type: "text", messageId, sentAt, senderIdentity: next.identityPublicKey, body };
-        const encrypted = await mlsCreateMessage(next.mlsClientState, contact.mlsGroupId, await encodeSecureContent(content));
-        const pendingEnvelope = envelopeForPacket({ kind: "mls", hint: await mlsGroupHint(contact.mlsGroupId), message: encrypted.message });
-        next.mlsClientState = encrypted.client_state; next.messages.push({ id: messageId, contactId: contact.id, direction: "outgoing", body, sentAt, delivery: "queued", pendingEnvelope }); await persist(next);
-        await depositEnvelope(contact.target, pendingEnvelope);
-        next = structuredClone(accountRef.current); const message = next.messages.find((item) => item.id === messageId); if (message) { message.delivery = "server-accepted"; message.pendingEnvelope = undefined; } await persist(next);
-      } catch (cause) {
-        next = structuredClone(accountRef.current); const message = next.messages.find((item) => item.id === messageId); if (message) { message.delivery = navigator.onLine ? "failed" : "queued"; message.error = navigator.onLine ? errorMessage(cause, "Send failed") : undefined; } else { next.messages.push({ id: messageId, contactId, direction: "outgoing", body, sentAt, delivery: "failed", error: errorMessage(cause, "Encryption failed") }); } await persist(next);
-      }
+      // Clear the compose draft locally — the draft is device-local and never
+      // travels in the shared blob.
+      const cleared = structuredClone(accountRef.current); const localContact = cleared.contacts.find((item) => item.id === contactId); if (localContact) localContact.draft = ""; await persist(cleared);
+      await mutateState(async (shared) => {
+        const contact = shared.contacts.find((item) => item.id === contactId);
+        if (!contact?.mlsGroupId) return { changed: false, value: undefined };
+        try {
+          const content: SecureContent = { version: 1, type: "text", messageId, sentAt, senderIdentity: shared.identityPublicKey, body };
+          const encrypted = await mlsCreateMessage(shared.mlsClientState, contact.mlsGroupId, await encodeSecureContent(content));
+          const pendingEnvelope = envelopeForPacket({ kind: "mls", hint: await mlsGroupHint(contact.mlsGroupId), message: encrypted.message });
+          // Commit the ratchet advance and the queued message together; the poll's
+          // outbox drain deposits the envelope and marks it accepted.
+          shared.mlsClientState = encrypted.client_state; contact.lastMessageAt = sentAt;
+          shared.messages.push({ id: messageId, contactId, direction: "outgoing", body, sentAt, delivery: "queued", pendingEnvelope });
+        } catch (cause) {
+          shared.messages.push({ id: messageId, contactId, direction: "outgoing", body, sentAt, delivery: "failed", error: errorMessage(cause, "Encryption failed") });
+        }
+        return { changed: true, value: undefined };
+      });
+      await queueMirrorSnapshot();
     });
-    await queueMirrorSnapshot();
+    void poll();
   };
 
-  const retryMessage = async (message: MessageRecord) => runExclusive(async () => {
-    const contact = accountRef.current.contacts.find((item) => item.id === message.contactId);
-    // Re-read the outbox record inside the lock — the render-time prop may be
-    // stale if a poll already delivered or cleared this message.
-    const record = accountRef.current.messages.find((item) => item.id === message.id);
-    if (!contact?.mlsGroupId || !record || record.delivery !== "failed") return;
-    let next = structuredClone(accountRef.current); const pending = next.messages.find((item) => item.id === message.id); if (pending) { pending.delivery = "queued"; pending.error = undefined; } await persist(next);
-    try {
-      if (!record.pendingEnvelope) throw new Error("The encrypted outbox record is unavailable.");
-      await depositEnvelope(contact.target, record.pendingEnvelope);
-      next = structuredClone(accountRef.current); const sent = next.messages.find((item) => item.id === message.id); if (sent) { sent.delivery = "server-accepted"; sent.pendingEnvelope = undefined; } await persist(next);
-    } catch (cause) {
-      next = structuredClone(accountRef.current); const failed = next.messages.find((item) => item.id === message.id); if (failed) { failed.delivery = "failed"; failed.error = errorMessage(cause, "Send failed"); } await persist(next);
-    }
-  });
+  const retryMessage = async (message: MessageRecord) => {
+    // Re-queue the failed message inside the lock (re-reading the record, since the
+    // render-time prop may be stale), then let the poll's outbox drain redeposit it.
+    await runExclusive(() => mutateState(async (shared) => {
+      const record = shared.messages.find((item) => item.id === message.id);
+      if (!record || record.direction !== "outgoing" || record.delivery !== "failed" || !record.pendingEnvelope) return { changed: false, value: undefined };
+      record.delivery = "queued"; record.error = undefined;
+      return { changed: true, value: undefined };
+    }));
+    void poll();
+  };
 
   const updateDraft = (value: string) => {
     const next = structuredClone(account); const contact = next.contacts.find((item) => item.id === selectedId); if (contact) contact.draft = value; setAccount(next);
   };
 
   const blockContact = async (contactId: string) => {
-    const changed = await runExclusive(async () => {
-      const next = structuredClone(accountRef.current); const contact = next.contacts.find((item) => item.id === contactId);
-      if (!contact) return false;
-      if (contact.inboundCapabilityId) await revokeDepositCapability(ownServer, next.adminCapability, contact.inboundCapabilityId);
-      contact.status = "blocked"; contact.draft = ""; await persist(next); setSelectedId("");
-      return true;
-    });
-    if (changed) await queueMirrorSnapshot();
+    const contact = accountRef.current.contacts.find((item) => item.id === contactId);
+    if (contact?.inboundCapabilityId) await revokeDepositCapability(ownServer, accountRef.current.adminCapability, contact.inboundCapabilityId);
+    const changed = await runExclusive(() => mutateState(async (shared) => {
+      const match = shared.contacts.find((item) => item.id === contactId);
+      if (!match) return { changed: false, value: false };
+      match.status = "blocked";
+      return { changed: true, value: true };
+    }));
+    if (changed) { setSelectedId(""); await queueMirrorSnapshot(); }
   };
 
   const acceptRequest = async (accepted: boolean) => {
@@ -700,17 +1017,17 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
       return;
     }
     const contactId = selected.id;
-    await runExclusive(async () => {
-      let next = structuredClone(accountRef.current); const contact = next.contacts.find((item) => item.id === contactId); if (!contact) return;
-      contact.status = "accepted"; await persist(next);
-      if (contact.mlsGroupId) {
-        try {
-          const content: SecureContent = { version: 1, type: "profile", messageId: crypto.randomUUID(), sentAt: Date.now(), senderIdentity: next.identityPublicKey, displayName: next.displayName };
-          const encrypted = await mlsCreateMessage(next.mlsClientState, contact.mlsGroupId, await encodeSecureContent(content)); next = structuredClone(accountRef.current); next.mlsClientState = encrypted.client_state; await persist(next);
-          await depositEnvelope(contact.target, envelopeForPacket({ kind: "mls", hint: await mlsGroupHint(contact.mlsGroupId), message: encrypted.message }));
-        } catch (cause) { setError(errorMessage(cause, "The contact was accepted, but your profile could not be sent.")); }
-      }
-    });
+    await runExclusive(() => mutateState(async (shared) => {
+      const contact = shared.contacts.find((item) => item.id === contactId); if (!contact) return { changed: false, value: undefined };
+      contact.status = "accepted";
+      if (!contact.mlsGroupId) return { changed: true, value: undefined };
+      const content: SecureContent = { version: 1, type: "profile", messageId: crypto.randomUUID(), sentAt: Date.now(), senderIdentity: shared.identityPublicKey, displayName: shared.displayName };
+      const encrypted = await mlsCreateMessage(shared.mlsClientState, contact.mlsGroupId, await encodeSecureContent(content));
+      shared.mlsClientState = encrypted.client_state;
+      const envelope = envelopeForPacket({ kind: "mls", hint: await mlsGroupHint(contact.mlsGroupId), message: encrypted.message });
+      const target = { ...contact.target };
+      return { changed: true, deferred: async () => { await depositEnvelope(target, envelope).catch((cause) => setError(errorMessage(cause, "The contact was accepted, but your profile could not be sent."))); }, value: undefined };
+    }));
     await queueMirrorSnapshot();
   };
 
@@ -766,9 +1083,10 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     </section>
     {dialog === "add" && <AddContactModal busy={busy} onAdd={addContact} onClose={() => setDialog(null)} />}
     {dialog === "invite" && <InviteModal value={inviteValue} qr={inviteQr} onClose={() => setDialog(null)} />}
-    {dialog === "settings" && <SettingsModal account={account} mode={transportMode ? modeLabel(transportMode) : "Blocked"} onExport={exportRecovery} onLink={() => setDialog("link")} onUnlink={() => void unlinkDevice().catch((cause) => setError(errorMessage(cause, "Could not unlink this device.")))} onLock={onLock} onClose={() => setDialog(null)} />}
+    {dialog === "settings" && <SettingsModal account={account} mode={transportMode ? modeLabel(transportMode) : "Blocked"} devices={devices} onExport={exportRecovery} onLink={() => setDialog("link")} onAddDevice={() => { setAddDeviceSas(""); setDialog("device"); }} onRemoveDevice={(id) => void removeDevice(id).catch((cause) => setError(errorMessage(cause, "Could not remove the device.")))} onUnlink={() => void unlinkDevice().catch((cause) => setError(errorMessage(cause, "Could not unlink this device.")))} onLock={onLock} onClose={() => setDialog(null)} />}
     {dialog === "link" && <LinkDeviceModal setup={linkSetup} onPrepare={(code) => void prepareDeviceLink(code).catch((cause) => setError(errorMessage(cause, "Could not prepare device pairing.")))} onConfirm={() => void confirmDeviceLink().catch((cause) => setError(errorMessage(cause, "Could not finish device pairing.")))} onClose={() => void cancelDeviceLink()} />}
-    {dialog === "security" && selected && <SecurityModal account={account} contact={selected} onNickname={async (nickname) => runExclusive(async () => { const next = structuredClone(accountRef.current); const match = next.contacts.find((item) => item.id === selected.id); if (match) match.localName = nickname.trim() || undefined; await persist(next); })} onBlock={async () => { if (confirm(`Block ${selected.localName ?? selected.displayName} and revoke their mailbox access?`)) { try { await blockContact(selected.id); setDialog(null); } catch (cause) { setError(errorMessage(cause, "Could not block this contact.")); } } }} onVerified={async () => { await runExclusive(async () => { const next = structuredClone(accountRef.current); const match = next.contacts.find((item) => item.id === selected.id); if (match) match.verified = true; await persist(next); }); setDialog(null); }} onClose={() => setDialog(null)} />}
+    {dialog === "device" && <DeviceModal sas={addDeviceSas} onScan={(code) => void addDevice(code).catch((cause) => setError(errorMessage(cause, "Could not add the device.")))} onClose={() => { setDialog("settings"); setAddDeviceSas(""); }} />}
+    {dialog === "security" && selected && <SecurityModal account={account} contact={selected} onNickname={async (nickname) => runExclusive(() => mutateState(async (shared) => { const match = shared.contacts.find((item) => item.id === selected.id); if (match) match.localName = nickname.trim() || undefined; return { changed: Boolean(match), value: undefined }; }))} onBlock={async () => { if (confirm(`Block ${selected.localName ?? selected.displayName} and revoke their mailbox access?`)) { try { await blockContact(selected.id); setDialog(null); } catch (cause) { setError(errorMessage(cause, "Could not block this contact.")); } } }} onVerified={async () => { await runExclusive(() => mutateState(async (shared) => { const match = shared.contacts.find((item) => item.id === selected.id); if (match) match.verified = true; return { changed: Boolean(match), value: undefined }; })); setDialog(null); }} onClose={() => setDialog(null)} />}
     {error && <Notice error={error} onClose={() => setError("")} />}
   </main>;
 }
@@ -804,8 +1122,47 @@ function InviteModal({ value, qr, onClose }: { value: string; qr: string; onClos
   return <Modal title="Your contact invitation" onClose={onClose}><div className="invite-modal"><p>Share this invitation with one person through a trusted channel. It grants write-only access to your mailbox.</p>{qr && <img src={qr} alt="Blackspace contact invitation QR code" />}<textarea readOnly value={value} rows={5} /><button className="primary wide" onClick={async () => { await navigator.clipboard.writeText(value); setCopied(true); }}>{copied ? <><Check /> Copied</> : <><Copy /> Copy invitation</>}</button><small>Revoke this invitation if it is exposed or abused.</small></div></Modal>;
 }
 
-function SettingsModal({ account, mode, onExport, onLink, onUnlink, onLock, onClose }: { account: AccountState; mode: string; onExport(): void; onLink(): void; onUnlink(): void; onLock(): void; onClose(): void }) {
-  return <Modal title="Settings" onClose={onClose}><div className="settings-profile"><span className="avatar large">{initials(account.displayName)}</span><div><h3>{account.displayName}</h3><p>{account.instanceName}</p></div></div><div className="settings-list"><div><Server /><span><strong>Transport</strong><small>{mode}</small></span></div><div><KeyRound /><span><strong>Identity</strong><small>{account.identityPublicKey.slice(0, 18)}…</small></span></div><div><Archive /><span><strong>Local vault</strong><small>Encrypted browser storage</small></span></div></div><div className="modal-actions stack">{account.companionLink?.active ? <button className="secondary wide danger-action" onClick={onUnlink}><Users /> Unlink companion</button> : <button className="secondary wide" onClick={onLink}><Users /> Link a companion</button>}<button className="secondary wide" onClick={onExport}><Download /> Export encrypted recovery kit</button><button className="secondary wide" onClick={onLock}><LogOut /> Lock Blackspace</button></div><p className="alpha-warning"><CircleAlert /> Private alpha: browser storage cannot guarantee physical erasure of old encrypted pages.</p></Modal>;
+function SettingsModal({ account, mode, devices, onExport, onLink, onAddDevice, onRemoveDevice, onUnlink, onLock, onClose }: { account: AccountState; mode: string; devices: DeviceRecord[]; onExport(): void; onLink(): void; onAddDevice(): void; onRemoveDevice(id: string): void; onUnlink(): void; onLock(): void; onClose(): void }) {
+  const active = devices.filter((device) => !device.revoked);
+  return <Modal title="Settings" onClose={onClose}><div className="settings-profile"><span className="avatar large">{initials(account.displayName)}</span><div><h3>{account.displayName}</h3><p>{account.instanceName}</p></div></div><div className="settings-list"><div><Server /><span><strong>Transport</strong><small>{mode}</small></span></div><div><KeyRound /><span><strong>Identity</strong><small>{account.identityPublicKey.slice(0, 18)}…</small></span></div><div><Server /><span><strong>Server address</strong><small>{account.onionOrigin.replace(/^https?:\/\//, "").slice(0, 22)}…</small></span></div><div><Archive /><span><strong>Local vault</strong><small>Encrypted browser storage</small></span></div></div>
+    <div className="settings-list">
+      <div><Users /><span><strong>Your devices</strong><small>{account.rootSecret ? `${active.length} linked${active.length === 1 ? " (this one)" : ""}` : "Multi-device off — add a device to enable"}</small></span></div>
+      {active.map((device) => <div key={device.id}><MessageCircle /><span><strong>{device.label}{device.id === account.deviceId ? " (this device)" : ""}</strong><small>Added {formatDay(device.enrolled_at * 1000)}</small></span>{device.id !== account.deviceId && <button className="text-button danger" onClick={() => onRemoveDevice(device.id)}>Remove</button>}</div>)}
+    </div>
+    <div className="modal-actions stack">
+      <button className="secondary wide" onClick={onAddDevice}><Plus /> Add a device</button>
+      {account.companionLink?.active ? <button className="secondary wide danger-action" onClick={onUnlink}><Users /> Unlink companion</button> : <button className="secondary wide" onClick={onLink}><Users /> Link a companion (mirror)</button>}
+      <button className="secondary wide" onClick={onExport}><Download /> Export encrypted recovery kit</button>
+      <button className="secondary wide" onClick={onLock}><LogOut /> Lock Blackspace</button>
+    </div><p className="alpha-warning"><CircleAlert /> Private alpha: browser storage cannot guarantee physical erasure of old encrypted pages. Removing a device does not yet re-key the others.</p></Modal>;
+}
+
+// Trusted-device side of one-scan enrollment: scan the new device's code, which
+// triggers sealing + parking, then show the SAS emoji to compare across screens.
+function DeviceModal({ sas, onScan, onClose }: { sas: string; onScan(code: string): void; onClose(): void }) {
+  const imageInput = useRef<HTMLInputElement>(null);
+  const [pasted, setPasted] = useState("");
+  const [scanError, setScanError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const scan = async (file?: File) => {
+    if (!file) return;
+    setBusy(true);
+    try { onScan(await scanQr(file)); setScanError(""); }
+    catch (cause) { setScanError(errorMessage(cause, "Could not scan the enrollment code.")); }
+    finally { setBusy(false); }
+  };
+  return <Modal title="Add a device" onClose={onClose}><div className="modal-content">{!sas ? <>
+    <p>On your new device choose “Add this device to my account,” then scan the code it shows.</p>
+    <input ref={imageInput} hidden type="file" accept="image/*" capture="environment" onChange={(event) => void scan(event.target.files?.[0])} />
+    <button className="secondary wide" onClick={() => imageInput.current?.click()} disabled={busy}><Hash size={16} /> Scan enrollment QR</button>
+    <label>Or paste the enrollment code<textarea rows={4} value={pasted} onChange={(event) => setPasted(event.target.value)} placeholder="blackspace://enroll/v1…" /></label>
+    {scanError && <p className="form-error"><CircleAlert size={16} />{scanError}</p>}
+    <button className="primary wide" onClick={() => onScan(pasted)} disabled={busy || !pasted.trim()}>Seal for this device</button>
+  </> : <>
+    <p>Confirm this emoji code matches the one on your new device, then finish there:</p>
+    <code>{sas}</code>
+    <button className="primary wide" onClick={onClose}>Done</button>
+  </>}</div></Modal>;
 }
 
 function LinkDeviceModal({ setup, onPrepare, onConfirm, onClose }: { setup?: { qr: string; qrImage: string; sas: string }; onPrepare(code: string): void; onConfirm(): void; onClose(): void }) {

@@ -3,11 +3,14 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use blackspace_core::MlsIdentityV1;
 use blackspace_protocol::{
-    AckRequestV1, AckResponseV1, ClaimKeyPackageResponseV1, CreateDepositCapabilityRequestV1,
-    CreateDepositCapabilityResponseV1, DepositAcceptedV1, DepositTargetV1, EnvelopeV1,
-    MailboxProvisionRequestV1, MailboxProvisionResponseV1, ProblemV1, PublishKeyPackagesRequestV1,
-    PublishKeyPackagesResponseV1, PullRequestV1, PullResponseV1, RecoverMailboxRequestV1,
-    RecoverMailboxResponseV1, RotateReadCapabilityRequestV1, RotateReadCapabilityResponseV1,
+    AckRequestV1, AckResponseV1, ClaimEnrollmentParcelResponseV1, ClaimKeyPackageResponseV1,
+    CreateDepositCapabilityRequestV1, CreateDepositCapabilityResponseV1, DepositAcceptedV1,
+    DepositTargetV1, EnvelopeV1, ListDevicesResponseV1, MailboxProvisionRequestV1,
+    MailboxProvisionResponseV1, MlsStateResponseV1, ParkEnrollmentParcelRequestV1,
+    ParkEnrollmentParcelResponseV1, ProblemV1, PublishKeyPackagesRequestV1,
+    PublishKeyPackagesResponseV1, PullRequestV1, PullResponseV1, PutMlsStateRequestV1,
+    PutMlsStateResponseV1, RecoverMailboxRequestV1, RecoverMailboxResponseV1,
+    RegisterDeviceRequestV1, RotateReadCapabilityRequestV1, RotateReadCapabilityResponseV1,
     ServerInfoV1,
 };
 use blackspace_tor::{
@@ -70,6 +73,12 @@ struct NativeCore {
 struct NativeIdentityPublic {
     identity_public_key: String,
     key_packages: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct NativePutMlsStateResponse {
+    conflict: bool,
+    version: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -464,6 +473,16 @@ async fn request_json<T: serde::de::DeserializeOwned>(
     response.json().await.map_err(safe_request_error)
 }
 
+async fn request_no_content(request: reqwest::RequestBuilder) -> Result<(), String> {
+    let response = request.send().await.map_err(safe_request_error)?;
+    let status = response.status();
+    if !status.is_success() {
+        let problem = response.json::<ProblemV1>().await.ok();
+        return Err(safe_mailbox_error(status.as_u16(), problem.as_ref()));
+    }
+    Ok(())
+}
+
 fn safe_mailbox_error(status: u16, problem: Option<&ProblemV1>) -> String {
     // Never forward arbitrary server text into the webview. These codes map to fixed,
     // non-secret wording defined by our own protocol.
@@ -700,6 +719,179 @@ async fn acknowledge_envelopes(
     .await
 }
 
+#[tauri::command]
+async fn get_mls_state(
+    manager: State<'_, Arc<TorManager>>,
+    server_url: String,
+    admin_capability: String,
+) -> Result<Option<MlsStateResponseV1>, String> {
+    let (client, origin) = tor_client(&manager, &server_url).await?;
+    let response = client
+        .get(format!("{origin}/v1/mailbox/mls-state"))
+        .header(
+            "authorization",
+            format!("BlackspaceAdmin {admin_capability}"),
+        )
+        .send()
+        .await
+        .map_err(safe_request_error)?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT {
+        return Ok(None);
+    }
+    let status = response.status();
+    if !status.is_success() {
+        let problem = response.json::<ProblemV1>().await.ok();
+        return Err(safe_mailbox_error(status.as_u16(), problem.as_ref()));
+    }
+    response
+        .json::<MlsStateResponseV1>()
+        .await
+        .map(Some)
+        .map_err(safe_request_error)
+}
+
+#[tauri::command]
+async fn put_mls_state(
+    manager: State<'_, Arc<TorManager>>,
+    server_url: String,
+    admin_capability: String,
+    request: PutMlsStateRequestV1,
+) -> Result<NativePutMlsStateResponse, String> {
+    let (client, origin) = tor_client(&manager, &server_url).await?;
+    let response = client
+        .put(format!("{origin}/v1/mailbox/mls-state"))
+        .header(
+            "authorization",
+            format!("BlackspaceAdmin {admin_capability}"),
+        )
+        .json(&request)
+        .send()
+        .await
+        .map_err(safe_request_error)?;
+    if response.status() == reqwest::StatusCode::CONFLICT {
+        return Ok(NativePutMlsStateResponse {
+            conflict: true,
+            version: None,
+        });
+    }
+    let status = response.status();
+    if !status.is_success() {
+        let problem = response.json::<ProblemV1>().await.ok();
+        return Err(safe_mailbox_error(status.as_u16(), problem.as_ref()));
+    }
+    let result = response
+        .json::<PutMlsStateResponseV1>()
+        .await
+        .map_err(safe_request_error)?;
+    Ok(NativePutMlsStateResponse {
+        conflict: false,
+        version: Some(result.version),
+    })
+}
+
+#[tauri::command]
+async fn park_enrollment_parcel(
+    manager: State<'_, Arc<TorManager>>,
+    server_url: String,
+    admin_capability: String,
+    request: ParkEnrollmentParcelRequestV1,
+) -> Result<ParkEnrollmentParcelResponseV1, String> {
+    let (client, origin) = tor_client(&manager, &server_url).await?;
+    request_json(
+        client
+            .post(format!("{origin}/v1/enroll/parcels"))
+            .header(
+                "authorization",
+                format!("BlackspaceAdmin {admin_capability}"),
+            )
+            .json(&request),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn claim_enrollment_parcel(
+    manager: State<'_, Arc<TorManager>>,
+    server_url: String,
+    claim_secret: String,
+) -> Result<Option<ClaimEnrollmentParcelResponseV1>, String> {
+    let (client, origin) = tor_client(&manager, &server_url).await?;
+    let response = client
+        .post(format!("{origin}/v1/enroll/parcels/claim"))
+        .header("authorization", format!("BlackspaceEnroll {claim_secret}"))
+        .send()
+        .await
+        .map_err(safe_request_error)?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let status = response.status();
+    if !status.is_success() {
+        let problem = response.json::<ProblemV1>().await.ok();
+        return Err(safe_mailbox_error(status.as_u16(), problem.as_ref()));
+    }
+    response
+        .json::<ClaimEnrollmentParcelResponseV1>()
+        .await
+        .map(Some)
+        .map_err(safe_request_error)
+}
+
+#[tauri::command]
+async fn register_device(
+    manager: State<'_, Arc<TorManager>>,
+    server_url: String,
+    admin_capability: String,
+    request: RegisterDeviceRequestV1,
+) -> Result<(), String> {
+    let (client, origin) = tor_client(&manager, &server_url).await?;
+    request_no_content(
+        client
+            .post(format!("{origin}/v1/mailbox/devices"))
+            .header(
+                "authorization",
+                format!("BlackspaceAdmin {admin_capability}"),
+            )
+            .json(&request),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn list_devices(
+    manager: State<'_, Arc<TorManager>>,
+    server_url: String,
+    admin_capability: String,
+) -> Result<ListDevicesResponseV1, String> {
+    let (client, origin) = tor_client(&manager, &server_url).await?;
+    request_json(client.get(format!("{origin}/v1/mailbox/devices")).header(
+        "authorization",
+        format!("BlackspaceAdmin {admin_capability}"),
+    ))
+    .await
+}
+
+#[tauri::command]
+async fn revoke_device(
+    manager: State<'_, Arc<TorManager>>,
+    server_url: String,
+    admin_capability: String,
+    device_id: String,
+) -> Result<(), String> {
+    let id =
+        uuid::Uuid::parse_str(&device_id).map_err(|_| "Invalid device identifier.".to_string())?;
+    let (client, origin) = tor_client(&manager, &server_url).await?;
+    request_no_content(
+        client
+            .delete(format!("{origin}/v1/mailbox/devices/{id}"))
+            .header(
+                "authorization",
+                format!("BlackspaceAdmin {admin_capability}"),
+            ),
+    )
+    .await
+}
+
 pub fn run() {
     let manager = Arc::new(TorManager::new());
     let setup_manager = manager.clone();
@@ -744,6 +936,13 @@ pub fn run() {
             native_vault::native_delete_vault,
             pull_envelopes,
             acknowledge_envelopes,
+            get_mls_state,
+            put_mls_state,
+            park_enrollment_parcel,
+            claim_enrollment_parcel,
+            register_device,
+            list_devices,
+            revoke_device,
         ])
         .on_window_event({
             move |_window, event| {

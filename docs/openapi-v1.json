@@ -85,6 +85,72 @@
         }
       }
     },
+    "/v1/enroll/parcels": {
+      "post": {
+        "tags": [],
+        "operationId": "api_park_enrollment_parcel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ParkEnrollmentParcelRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ParkEnrollmentParcelResponseV1"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/enroll/parcels/claim": {
+      "post": {
+        "tags": [],
+        "operationId": "api_claim_enrollment_parcel",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaimEnrollmentParcelResponseV1"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/info": {
       "get": {
         "tags": [],
@@ -211,6 +277,95 @@
         }
       }
     },
+    "/v1/mailbox/devices": {
+      "get": {
+        "tags": [],
+        "operationId": "api_list_devices",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListDevicesResponseV1"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "api_register_device",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterDeviceRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mailbox/devices/{device_id}": {
+      "delete": {
+        "tags": [],
+        "operationId": "api_revoke_device",
+        "parameters": [
+          {
+            "name": "device_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/mailbox/key-packages": {
       "post": {
         "tags": [],
@@ -237,6 +392,83 @@
             }
           },
           "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mailbox/mls-state": {
+      "get": {
+        "tags": [],
+        "operationId": "api_get_mls_state",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MlsStateResponseV1"
+                }
+              }
+            }
+          },
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [],
+        "operationId": "api_put_mls_state",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutMlsStateRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PutMlsStateResponseV1"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          },
+          "409": {
             "description": "",
             "content": {
               "application/json": {
@@ -431,6 +663,30 @@
           }
         }
       },
+      "ClaimEnrollmentParcelResponseV1": {
+        "type": "object",
+        "required": [
+          "eph_pub",
+          "nonce",
+          "size_class",
+          "ciphertext"
+        ],
+        "properties": {
+          "ciphertext": {
+            "type": "string"
+          },
+          "eph_pub": {
+            "type": "string"
+          },
+          "nonce": {
+            "type": "string"
+          },
+          "size_class": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
       "ClaimKeyPackageResponseV1": {
         "type": "object",
         "required": [
@@ -504,6 +760,31 @@
           }
         }
       },
+      "DeviceV1": {
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "enrolled_at",
+          "revoked"
+        ],
+        "properties": {
+          "enrolled_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "label": {
+            "type": "string"
+          },
+          "revoked": {
+            "type": "boolean"
+          }
+        }
+      },
       "EnvelopeV1": {
         "type": "object",
         "required": [
@@ -556,6 +837,10 @@
           "mls": {
             "type": "boolean"
           },
+          "multi_device": {
+            "type": "boolean",
+            "description": "Floating-primary multi-device: shared MLS-state CAS blob + one-scan enrollment.\nDefaulted so a client can still parse an older server's /v1/info without it."
+          },
           "opaque_transport": {
             "type": "boolean"
           },
@@ -600,6 +885,20 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          }
+        }
+      },
+      "ListDevicesResponseV1": {
+        "type": "object",
+        "required": [
+          "devices"
+        ],
+        "properties": {
+          "devices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeviceV1"
+            }
           }
         }
       },
@@ -652,6 +951,74 @@
             "format": "uuid"
           },
           "mailbox_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "MlsStateResponseV1": {
+        "type": "object",
+        "description": "The shared, client-encrypted MLS client state. `version` is a monotonically\nincreasing compare-and-swap counter: only the latest is stored (older ratchet\nstates are overwritten, limiting the forward-secrecy exposure of at-rest state).",
+        "required": [
+          "version",
+          "size_class",
+          "ciphertext"
+        ],
+        "properties": {
+          "ciphertext": {
+            "type": "string"
+          },
+          "size_class": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "ParkEnrollmentParcelRequestV1": {
+        "type": "object",
+        "description": "A one-time enrollment parcel parked by an already-enrolled device for a new\ndevice to claim. The ciphertext is sealed to the new device's ephemeral public\nkey (carried in `eph_pub`); the server sees only opaque bytes and never a secret.",
+        "required": [
+          "parcel_verifier",
+          "eph_pub",
+          "nonce",
+          "size_class",
+          "ciphertext",
+          "expires_at"
+        ],
+        "properties": {
+          "ciphertext": {
+            "type": "string"
+          },
+          "eph_pub": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "nonce": {
+            "type": "string"
+          },
+          "parcel_verifier": {
+            "type": "string"
+          },
+          "size_class": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ParkEnrollmentParcelResponseV1": {
+        "type": "object",
+        "required": [
+          "parcel_id"
+        ],
+        "properties": {
+          "parcel_id": {
             "type": "string",
             "format": "uuid"
           }
@@ -773,6 +1140,40 @@
           }
         }
       },
+      "PutMlsStateRequestV1": {
+        "type": "object",
+        "description": "Compare-and-swap write of the shared MLS state. The write succeeds only when\n`expected_version` equals the currently stored version (0 for the first write);\notherwise the server returns 409 and the client re-reads before retrying. This\nis what makes a ratchet fork impossible across concurrent devices.",
+        "required": [
+          "expected_version",
+          "size_class",
+          "ciphertext"
+        ],
+        "properties": {
+          "ciphertext": {
+            "type": "string"
+          },
+          "expected_version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "size_class": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "PutMlsStateResponseV1": {
+        "type": "object",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "RecoverMailboxRequestV1": {
         "type": "object",
         "required": [
@@ -829,6 +1230,22 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "RegisterDeviceRequestV1": {
+        "type": "object",
+        "required": [
+          "device_id",
+          "label"
+        ],
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "label": {
+            "type": "string"
           }
         }
       },

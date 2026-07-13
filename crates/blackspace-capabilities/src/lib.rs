@@ -16,6 +16,8 @@ pub enum CapabilityKind {
     Read,
     Admin,
     Deposit,
+    /// One-time bearer that lets a new device claim its parked enrollment parcel.
+    Enroll,
 }
 
 impl CapabilityKind {
@@ -26,6 +28,7 @@ impl CapabilityKind {
             Self::Read => b"blackspace:v1:read:",
             Self::Admin => b"blackspace:v1:admin:",
             Self::Deposit => b"blackspace:v1:deposit:",
+            Self::Enroll => b"blackspace:v1:enroll:",
         }
     }
 }
