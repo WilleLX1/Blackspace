@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive, ArrowLeft, Check, CheckCheck, CircleAlert, Copy, Download,
-  Fingerprint, Hash, Inbox, KeyRound, Lock, LogOut, MessageCircle, Plus,
+  Fingerprint, Inbox, KeyRound, Lock, LogOut, MessageCircle, Plus,
   RefreshCw, Search, Send, Server, Settings, ShieldCheck, UserPlus, Users, X,
 } from "lucide-react";
 import QRCode from "qrcode";
@@ -18,16 +18,17 @@ import {
   type SecureContent,
 } from "./crypto";
 import { base64Url } from "./crypto";
-import { errorMessage } from "./errors";
+import { errorMessage, explainErrorMessage } from "./errors";
 import { contactFingerprint, decodeSecureContent, encodeSecureContent, mlsCreateMessage, mlsGenerate, mlsGroupHint, mlsJoin, mlsProcessMessage, mlsRecoveryIdentitySnapshot, mlsReplenish, mlsStart } from "./mls";
-import type { AccountState, CompanionAccountState, ContactRecord, DepositTarget, KeyPackageWire, MessageRecord, PendingEnvelope, ServerInfo, StoredAccount } from "./model";
+import type { AccountState, CompanionAccountState, ContactRecord, DeliveryState, DepositTarget, KeyPackageWire, MessageRecord, PendingEnvelope, ServerInfo, StoredAccount } from "./model";
 import { onboardingError, type OnboardingStage } from "./onboarding";
 import { applyDownlinkEvent, buildSnapshot, newMessage, projectContact } from "./companion";
 import { classify, openLinkEvent, sealLinkEvent, type DownlinkEvent, type UplinkCommand } from "./link";
 import { createCompanionPairingOffer, createPrimaryPairingResponse, openPrimaryPairingResponse, type CompanionPairingOffer, type PairingBundle } from "./pairing";
 import { detectTransportMode, deriveTransportMode, modeLabel, validateServerUrl } from "./security";
 import { createRecoveryKit, deleteVault, lockVault, openRecoveryKit, saveVault, unlockVault, vaultExists } from "./vault";
-import { pairingQrImage, scanQr } from "./qr";
+import { pairingQrImage } from "./qr";
+import { QrScanControls } from "./qrscan";
 import { createSerialRunner } from "./serial";
 import {
   createEnrollmentOffer, openEnrollmentParcel, openMlsState, parseEnrollmentOffer, randomRootSecret,
@@ -37,10 +38,12 @@ import { RollbackError, serverTransport, withMlsState } from "./mlsstate";
 import { applyShared, extractShared, parseShared, serializeShared, type SharedState } from "./sharedstate";
 
 type Screen = "loading" | "welcome" | "locked" | "messenger";
-type Dialog = "add" | "invite" | "settings" | "security" | "link" | "device" | null;
+type Dialog = "add" | "invite" | "settings" | "security" | "link" | "device" | "diagnostics" | null;
 
 const initials = (name: string) => name.split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("") || "?";
 const deviceLabel = () => (navigator.userAgent.includes("Mobile") ? "Phone" : "Browser");
+const DELIVERY_LABELS: Record<DeliveryState, string> = { queued: "Queued", "server-accepted": "Server accepted", delivered: "Delivered", failed: "Failed" };
+const deliveryLabel = (state: DeliveryState) => DELIVERY_LABELS[state] ?? state;
 const formatTime = (value: number) => new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(value);
 const formatDay = (value: number) => new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(value);
 const wirePackages = (packages: string[], identity: string): KeyPackageWire[] => {
@@ -64,7 +67,17 @@ function ModeBadge() {
 }
 
 function Notice({ error, onClose }: { error: string; onClose(): void }) {
-  return <div className="toast" role="alert"><CircleAlert size={18} /><span>{error}</span><button onClick={onClose} aria-label="Dismiss"><X size={16} /></button></div>;
+  const [open, setOpen] = useState(false);
+  const help = explainErrorMessage(error);
+  return <div className="toast" role="alert">
+    <CircleAlert size={18} />
+    <div className="toast-body">
+      <span>{error}</span>
+      {help && <button className="toast-more" onClick={() => setOpen((value) => !value)}>{open ? "Hide details" : "What does this mean?"}</button>}
+      {open && help && <p className="toast-detail">{help}</p>}
+    </div>
+    <button className="toast-close" onClick={onClose} aria-label="Dismiss"><X size={16} /></button>
+  </div>;
 }
 
 function WelcomeScreen({ onComplete }: { onComplete(state: StoredAccount, passphrase: string): void }) {
@@ -218,17 +231,11 @@ function LinkCompanionScreen({ onComplete, onCancel }: { onComplete(state: Compa
   const [passphrase, setPassphrase] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState("");
-  const responseImage = useRef<HTMLInputElement>(null);
   useEffect(() => { void createCompanionPairingOffer().then(async (value) => { setOffer(value); setOfferQr(await pairingQrImage(value.qr)); }).catch((cause) => setError(errorMessage(cause, "Could not start pairing."))); }, []);
   const inspect = async () => {
     if (!offer) return;
     try { setOpened(await openPrimaryPairingResponse(offer, response)); setError(""); }
     catch (cause) { setError(errorMessage(cause, "The pairing response is invalid.")); }
-  };
-  const scanResponse = async (file?: File) => {
-    if (!file) return;
-    try { setResponse(await scanQr(file)); setError(""); }
-    catch (cause) { setError(errorMessage(cause, "Could not scan the pairing response.")); }
   };
   const finish = async () => {
     if (!offer || !opened) return;
@@ -244,7 +251,7 @@ function LinkCompanionScreen({ onComplete, onCancel }: { onComplete(state: Compa
       await saveVault(state, passphrase); onComplete(state, passphrase);
     } catch (cause) { setError(errorMessage(cause, "Could not save this linked device.")); }
   };
-  return <main className="lock-shell"><section className="lock-card"><span className="eyebrow">LINKED COMPANION</span><h1>Link this device</h1><p>Show this first code to your primary device. It contains only a temporary public key.</p>{offerQr && <img className="pairing-qr" src={offerQr} alt="Companion pairing offer" />}<textarea readOnly rows={4} value={offer?.qr ?? "Preparing…"} />{!opened ? <><label>Response from primary<textarea rows={5} value={response} onChange={(event) => setResponse(event.target.value)} /></label><input ref={responseImage} hidden type="file" accept="image/*" capture="environment" onChange={(event) => void scanResponse(event.target.files?.[0])} /><button className="secondary wide" onClick={() => responseImage.current?.click()}><Hash size={16} /> Scan response QR</button><button className="primary wide" onClick={inspect} disabled={!response.trim()}>Open response</button></> : <><p>Compare this code on both devices before confirming:</p><code>{opened.sas}</code><label>Local vault passphrase<input type="password" value={passphrase} onChange={(event) => setPassphrase(event.target.value)} /></label><label>Confirm passphrase<input type="password" value={confirm} onChange={(event) => setConfirm(event.target.value)} /></label><button className="primary wide" onClick={finish}>Codes match — link device</button></>}{error && <p className="form-error"><CircleAlert size={16} />{error}</p>}<button className="text-button" onClick={onCancel}>Cancel</button></section></main>;
+  return <main className="lock-shell"><section className="lock-card"><span className="eyebrow">LINKED COMPANION</span><h1>Link this device</h1><p>Show this first code to your primary device. It contains only a temporary public key.</p>{offerQr && <img className="pairing-qr" src={offerQr} alt="Companion pairing offer" />}<textarea readOnly rows={4} value={offer?.qr ?? "Preparing…"} />{!opened ? <><label>Response from primary<textarea rows={5} value={response} onChange={(event) => setResponse(event.target.value)} /></label><QrScanControls label="Scan response QR" onValue={(value) => { setResponse(value); setError(""); }} onError={setError} /><button className="primary wide" onClick={inspect} disabled={!response.trim()}>Open response</button></> : <><p>Compare this code on both devices before confirming:</p><code>{opened.sas}</code><label>Local vault passphrase<input type="password" value={passphrase} onChange={(event) => setPassphrase(event.target.value)} /></label><label>Confirm passphrase<input type="password" value={confirm} onChange={(event) => setConfirm(event.target.value)} /></label><button className="primary wide" onClick={finish}>Codes match — link device</button></>}{error && <p className="form-error"><CircleAlert size={16} />{error}</p>}<button className="text-button" onClick={onCancel}>Cancel</button></section></main>;
 }
 
 // New-device onboarding for multi-device: show one enrollment QR, wait for the
@@ -376,6 +383,8 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   const [linkSetup, setLinkSetup] = useState<{ pairingId: string; qr: string; qrImage: string; sas: string; linkSecret: string; downlinkCap: string; downlinkCapId: string; uplinkCapId: string }>();
   const [addDeviceSas, setAddDeviceSas] = useState("");
   const [devices, setDevices] = useState<DeviceRecord[]>([]);
+  const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
   const syncing = useRef(false);
   const syncFailures = useRef(0);
   const resumedPendingRotation = useRef(false);
@@ -954,31 +963,49 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   };
 
   const sendMessage = async () => {
+    // Synchronous re-entry guard: a laggy send must never fire twice from repeated
+    // clicks or Enter presses. Set before any await so the second call bails here.
+    if (sendingRef.current) return;
     if (!selected?.mlsGroupId || !selected.draft.trim()) return;
+    sendingRef.current = true; setSending(true);
     const body = selected.draft.trim(); const messageId = crypto.randomUUID(); const sentAt = Date.now(); const contactId = selected.id;
-    await runExclusive(async () => {
-      // Clear the compose draft locally — the draft is device-local and never
-      // travels in the shared blob.
-      const cleared = structuredClone(accountRef.current); const localContact = cleared.contacts.find((item) => item.id === contactId); if (localContact) localContact.draft = ""; await persist(cleared);
-      await mutateState(async (shared) => {
-        const contact = shared.contacts.find((item) => item.id === contactId);
-        if (!contact?.mlsGroupId) return { changed: false, value: undefined };
-        try {
+    try {
+      // Show the message immediately as Queued and clear the draft (both device-local),
+      // so it appears the instant you hit send — before any network round-trip.
+      const optimistic = structuredClone(accountRef.current);
+      const localContact = optimistic.contacts.find((item) => item.id === contactId);
+      if (localContact) { localContact.draft = ""; localContact.lastMessageAt = sentAt; }
+      optimistic.messages.push({ id: messageId, contactId, direction: "outgoing", body, sentAt, delivery: "queued" });
+      await persist(optimistic);
+      // Encrypt and commit the ratchet advance + queued envelope to the shared state.
+      // The op is idempotent w.r.t. the optimistic message (it attaches the envelope
+      // to it when present, else adds it) so the local and multi-device paths agree.
+      await runExclusive(async () => {
+        await mutateState(async (shared) => {
+          const contact = shared.contacts.find((item) => item.id === contactId);
+          if (!contact?.mlsGroupId) throw new Error("This conversation is unavailable.");
           const content: SecureContent = { version: 1, type: "text", messageId, sentAt, senderIdentity: shared.identityPublicKey, body };
           const encrypted = await mlsCreateMessage(shared.mlsClientState, contact.mlsGroupId, await encodeSecureContent(content));
           const pendingEnvelope = envelopeForPacket({ kind: "mls", hint: await mlsGroupHint(contact.mlsGroupId), message: encrypted.message });
-          // Commit the ratchet advance and the queued message together; the poll's
-          // outbox drain deposits the envelope and marks it accepted.
           shared.mlsClientState = encrypted.client_state; contact.lastMessageAt = sentAt;
-          shared.messages.push({ id: messageId, contactId, direction: "outgoing", body, sentAt, delivery: "queued", pendingEnvelope });
-        } catch (cause) {
-          shared.messages.push({ id: messageId, contactId, direction: "outgoing", body, sentAt, delivery: "failed", error: errorMessage(cause, "Encryption failed") });
-        }
-        return { changed: true, value: undefined };
+          const existing = shared.messages.find((item) => item.id === messageId);
+          if (existing) { existing.pendingEnvelope = pendingEnvelope; existing.delivery = "queued"; existing.error = undefined; }
+          else shared.messages.push({ id: messageId, contactId, direction: "outgoing", body, sentAt, delivery: "queued", pendingEnvelope });
+          return { changed: true, value: undefined };
+        });
+        await queueMirrorSnapshot();
       });
-      await queueMirrorSnapshot();
-    });
-    void poll();
+      void poll();
+    } catch (cause) {
+      // The optimistic message could not be encrypted/committed; mark it failed so
+      // the user can retry rather than leaving it stuck as Queued.
+      const failedState = structuredClone(accountRef.current);
+      const message = failedState.messages.find((item) => item.id === messageId);
+      if (message) { message.delivery = "failed"; message.error = errorMessage(cause, "Send failed"); await persist(failedState); }
+      setError(errorMessage(cause, "Send failed"));
+    } finally {
+      sendingRef.current = false; setSending(false);
+    }
   };
 
   const retryMessage = async (message: MessageRecord) => {
@@ -1068,7 +1095,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
       <ContactSection title="Direct messages" contacts={conversations} selectedId={selectedId} onSelect={selectContact} />
       {!filtered.length && <div className="sidebar-empty"><Users /><p>No conversations yet.</p></div>}
       <div className="sidebar-actions"><button className="secondary" onClick={() => setDialog("add")}><UserPlus /> Add contact</button><button className="icon-button" onClick={makeInvite} disabled={busy} title="Create invitation"><Plus /></button></div>
-      <footer><ModeBadge /><span className={`network-dot ${online ? "online" : ""}`} />{online ? "Connected" : "Offline"}</footer>
+      <footer><ModeBadge /><button className="network-status" onClick={() => setDialog("diagnostics")} title="Connection diagnostics"><span className={`network-dot ${online ? "online" : ""}`} />{online ? "Connected" : "Offline"}</button></footer>
     </aside>
     <section className={`chat-panel ${!mobileList ? "mobile-visible" : ""}`}>
       {selected ? <>
@@ -1078,7 +1105,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
           <div className="conversation-start"><div className="avatar hero-avatar">{initials(selected.displayName)}</div><h2>{selected.displayName}</h2><p>This is the beginning of your private Blackspace conversation.</p><button className="text-button" onClick={() => setDialog("security")}><Fingerprint /> Verify identity</button></div>
           {messages.map((message, index) => <MessageItem key={message.id} message={message} previous={messages[index - 1]} contact={selected} onRetry={retryMessage} />)}
         </div>
-        <div className="composer-wrap"><div className="composer"><textarea value={selected.draft} onChange={(event) => updateDraft(event.target.value)} onBlur={() => void persist(accountRef.current)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} maxLength={16_384} placeholder={`Message ${selected.localName ?? selected.displayName}`} rows={1} disabled={selected.status === "request"} /><span>{selected.draft.length > 14_000 ? `${selected.draft.length}/16384` : "Enter to send"}</span><button className="send-button" onClick={sendMessage} disabled={!selected.draft.trim() || selected.status === "request"}><Send /></button></div></div>
+        <div className="composer-wrap"><div className="composer"><textarea value={selected.draft} onChange={(event) => updateDraft(event.target.value)} onBlur={() => void persist(accountRef.current)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} maxLength={16_384} placeholder={`Message ${selected.localName ?? selected.displayName}`} rows={1} disabled={selected.status === "request"} /><span>{selected.draft.length > 14_000 ? `${selected.draft.length}/16384` : "Enter to send"}</span><button className="send-button" onClick={sendMessage} disabled={!selected.draft.trim() || selected.status === "request" || sending}><Send /></button></div></div>
       </> : <EmptyChat onAdd={() => setDialog("add")} onInvite={makeInvite} />}
     </section>
     {dialog === "add" && <AddContactModal busy={busy} onAdd={addContact} onClose={() => setDialog(null)} />}
@@ -1086,6 +1113,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     {dialog === "settings" && <SettingsModal account={account} mode={transportMode ? modeLabel(transportMode) : "Blocked"} devices={devices} onExport={exportRecovery} onLink={() => setDialog("link")} onAddDevice={() => { setAddDeviceSas(""); setDialog("device"); }} onRemoveDevice={(id) => void removeDevice(id).catch((cause) => setError(errorMessage(cause, "Could not remove the device.")))} onUnlink={() => void unlinkDevice().catch((cause) => setError(errorMessage(cause, "Could not unlink this device.")))} onLock={onLock} onClose={() => setDialog(null)} />}
     {dialog === "link" && <LinkDeviceModal setup={linkSetup} onPrepare={(code) => void prepareDeviceLink(code).catch((cause) => setError(errorMessage(cause, "Could not prepare device pairing.")))} onConfirm={() => void confirmDeviceLink().catch((cause) => setError(errorMessage(cause, "Could not finish device pairing.")))} onClose={() => void cancelDeviceLink()} />}
     {dialog === "device" && <DeviceModal sas={addDeviceSas} onScan={(code) => void addDevice(code).catch((cause) => setError(errorMessage(cause, "Could not add the device.")))} onClose={() => { setDialog("settings"); setAddDeviceSas(""); }} />}
+    {dialog === "diagnostics" && <DiagnosticsModal account={account} online={online} mode={transportMode ? modeLabel(transportMode) : "Blocked"} onClose={() => setDialog(null)} />}
     {dialog === "security" && selected && <SecurityModal account={account} contact={selected} onNickname={async (nickname) => runExclusive(() => mutateState(async (shared) => { const match = shared.contacts.find((item) => item.id === selected.id); if (match) match.localName = nickname.trim() || undefined; return { changed: Boolean(match), value: undefined }; }))} onBlock={async () => { if (confirm(`Block ${selected.localName ?? selected.displayName} and revoke their mailbox access?`)) { try { await blockContact(selected.id); setDialog(null); } catch (cause) { setError(errorMessage(cause, "Could not block this contact.")); } } }} onVerified={async () => { await runExclusive(() => mutateState(async (shared) => { const match = shared.contacts.find((item) => item.id === selected.id); if (match) match.verified = true; return { changed: Boolean(match), value: undefined }; })); setDialog(null); }} onClose={() => setDialog(null)} />}
     {error && <Notice error={error} onClose={() => setError("")} />}
   </main>;
@@ -1099,7 +1127,7 @@ function MessageItem({ message, previous, contact, onRetry }: { message: Message
   const grouped = previous?.direction === message.direction && message.sentAt - previous.sentAt < 5 * 60_000;
   return <div className={`message-row ${message.direction} ${grouped ? "grouped" : ""}`}>
     {message.direction === "incoming" && !grouped && <span className="avatar small">{initials(contact.displayName)}</span>}
-    <div className="message-body">{!grouped && <div className="message-meta"><strong>{message.direction === "system" ? "Blackspace" : message.direction === "outgoing" ? "You" : contact.localName ?? contact.displayName}</strong><span>{formatDay(message.sentAt)} at {formatTime(message.sentAt)}</span></div>}<div className="bubble">{message.body}</div>{message.direction === "outgoing" && <span className={`delivery ${message.delivery}`}>{message.delivery === "delivered" ? <CheckCheck /> : message.delivery === "failed" ? <CircleAlert /> : <Check />}{message.delivery.replace("-", " ")}{message.delivery === "failed" && <button className="retry-link" onClick={() => onRetry(message)}>Retry</button>}</span>}</div>
+    <div className="message-body">{!grouped && <div className="message-meta"><strong>{message.direction === "system" ? "Blackspace" : message.direction === "outgoing" ? "You" : contact.localName ?? contact.displayName}</strong><span>{formatDay(message.sentAt)} at {formatTime(message.sentAt)}</span></div>}<div className="bubble">{message.body}</div>{message.direction === "outgoing" && <span className={`delivery ${message.delivery}`}>{message.delivery === "delivered" ? <CheckCheck /> : message.delivery === "failed" ? <CircleAlert /> : <Check />}{deliveryLabel(message.delivery)}{message.delivery === "failed" && <button className="retry-link" onClick={() => onRetry(message)}>Retry</button>}</span>}</div>
   </div>;
 }
 
@@ -1108,13 +1136,8 @@ function EmptyChat({ onAdd, onInvite }: { onAdd(): void; onInvite(): void }) {
 }
 
 function AddContactModal({ busy, onAdd, onClose }: { busy: boolean; onAdd(value: string, first: string): void; onClose(): void }) {
-  const [value, setValue] = useState(""); const [first, setFirst] = useState("");
-  const imageInput = useRef<HTMLInputElement>(null);
-  const scan = async (file?: File) => {
-    if (!file) return;
-    try { setValue(await scanQr(file)); } catch (cause) { alert(errorMessage(cause, "Could not scan this QR code.")); }
-  };
-  return <Modal title="Add a contact" onClose={onClose}><div className="modal-content"><div className="modal-icon"><UserPlus /></div><p>Paste the invitation shared directly by your contact. Blackspace verifies their signed key package before sending.</p><label>Contact invitation<textarea rows={5} value={value} onChange={(event) => setValue(event.target.value)} placeholder="blackspace://contact/v1?onion=…#cap=…" spellCheck={false} /></label><input ref={imageInput} hidden type="file" accept="image/*" capture="environment" onChange={(event) => void scan(event.target.files?.[0])} /><button className="secondary wide" onClick={() => imageInput.current?.click()}><Hash size={16} /> Scan invitation QR</button><label>First message<textarea rows={3} value={first} maxLength={16_384} onChange={(event) => setFirst(event.target.value)} placeholder="Hello…" /></label><div className="modal-actions"><button className="secondary" onClick={onClose}>Cancel</button><button className="primary" onClick={() => onAdd(value, first)} disabled={busy || !value.trim()}>{busy ? "Establishing session…" : "Add and send"}</button></div></div></Modal>;
+  const [value, setValue] = useState(""); const [first, setFirst] = useState(""); const [scanError, setScanError] = useState("");
+  return <Modal title="Add a contact" onClose={onClose}><div className="modal-content"><div className="modal-icon"><UserPlus /></div><p>Paste the invitation shared directly by your contact. Blackspace verifies their signed key package before sending.</p><label>Contact invitation<textarea rows={5} value={value} onChange={(event) => setValue(event.target.value)} placeholder="blackspace://contact/v1?onion=…#cap=…" spellCheck={false} /></label><QrScanControls label="Scan invitation QR" onValue={(scanned) => { setValue(scanned); setScanError(""); }} onError={setScanError} />{scanError && <p className="form-error"><CircleAlert size={16} />{scanError}</p>}<label>First message<textarea rows={3} value={first} maxLength={16_384} onChange={(event) => setFirst(event.target.value)} placeholder="Hello…" /></label><div className="modal-actions"><button className="secondary" onClick={onClose}>Cancel</button><button className="primary" onClick={() => onAdd(value, first)} disabled={busy || !value.trim()}>{busy ? "Establishing session…" : "Add and send"}</button></div></div></Modal>;
 }
 
 function InviteModal({ value, qr, onClose }: { value: string; qr: string; onClose(): void }) {
@@ -1140,24 +1163,14 @@ function SettingsModal({ account, mode, devices, onExport, onLink, onAddDevice, 
 // Trusted-device side of one-scan enrollment: scan the new device's code, which
 // triggers sealing + parking, then show the SAS emoji to compare across screens.
 function DeviceModal({ sas, onScan, onClose }: { sas: string; onScan(code: string): void; onClose(): void }) {
-  const imageInput = useRef<HTMLInputElement>(null);
   const [pasted, setPasted] = useState("");
   const [scanError, setScanError] = useState("");
-  const [busy, setBusy] = useState(false);
-  const scan = async (file?: File) => {
-    if (!file) return;
-    setBusy(true);
-    try { onScan(await scanQr(file)); setScanError(""); }
-    catch (cause) { setScanError(errorMessage(cause, "Could not scan the enrollment code.")); }
-    finally { setBusy(false); }
-  };
   return <Modal title="Add a device" onClose={onClose}><div className="modal-content">{!sas ? <>
     <p>On your new device choose “Add this device to my account,” then scan the code it shows.</p>
-    <input ref={imageInput} hidden type="file" accept="image/*" capture="environment" onChange={(event) => void scan(event.target.files?.[0])} />
-    <button className="secondary wide" onClick={() => imageInput.current?.click()} disabled={busy}><Hash size={16} /> Scan enrollment QR</button>
+    <QrScanControls label="Scan enrollment QR" onValue={(code) => { setScanError(""); onScan(code); }} onError={setScanError} />
     <label>Or paste the enrollment code<textarea rows={4} value={pasted} onChange={(event) => setPasted(event.target.value)} placeholder="blackspace://enroll/v1…" /></label>
     {scanError && <p className="form-error"><CircleAlert size={16} />{scanError}</p>}
-    <button className="primary wide" onClick={() => onScan(pasted)} disabled={busy || !pasted.trim()}>Seal for this device</button>
+    <button className="primary wide" onClick={() => onScan(pasted)} disabled={!pasted.trim()}>Seal for this device</button>
   </> : <>
     <p>Confirm this emoji code matches the one on your new device, then finish there:</p>
     <code>{sas}</code>
@@ -1165,16 +1178,53 @@ function DeviceModal({ sas, onScan, onClose }: { sas: string; onScan(code: strin
   </>}</div></Modal>;
 }
 
+// Live connection check + server details, opened from the footer status. The check
+// re-fetches /v1/info and times it; everything shown is already known to this client.
+function DiagnosticsModal({ account, online, mode, onClose }: { account: AccountState; online: boolean; mode: string; onClose(): void }) {
+  const [info, setInfo] = useState<ServerInfo>();
+  const [state, setState] = useState<"checking" | "ok" | "error">("checking");
+  const [latency, setLatency] = useState<number>();
+  const [detail, setDetail] = useState("");
+  const origin = ownOrigin(account.onionOrigin, account.httpsOrigin);
+  const check = useCallback(async () => {
+    setState("checking"); setDetail("");
+    const start = Date.now();
+    try {
+      const result = await serverInfo(origin);
+      setInfo(result); setLatency(Date.now() - start); setState("ok");
+    } catch (cause) {
+      setState("error"); setDetail(errorMessage(cause, "Could not reach the mailbox."));
+    }
+  }, [origin]);
+  useEffect(() => { void check(); }, [check]);
+  const features = info ? Object.entries(info.features).filter(([, on]) => on).map(([name]) => name.replaceAll("_", " ")).join(", ") : "";
+  return <Modal title="Connection diagnostics" onClose={onClose}><div className="modal-content">
+    <div className={`diag-banner ${state}`}>
+      <span className={`network-dot ${state === "ok" ? "online" : ""}`} />
+      <strong>{state === "checking" ? "Checking…" : state === "ok" ? `Reachable${latency !== undefined ? ` · ${latency} ms` : ""}` : "Unreachable"}</strong>
+    </div>
+    {state === "error" && <><p className="form-error"><CircleAlert size={16} />{detail}</p>{explainErrorMessage(detail) && <p className="toast-detail">{explainErrorMessage(detail)}</p>}</>}
+    <div className="settings-list">
+      <div><Server /><span><strong>Transport</strong><small>{mode}</small></span></div>
+      <div><Server /><span><strong>Server address</strong><small>{origin.replace(/^https?:\/\//, "")}</small></span></div>
+      <div><MessageCircle /><span><strong>Browser network</strong><small>{online ? "Online" : "Offline"}</small></span></div>
+      <div><KeyRound /><span><strong>Mailbox ID</strong><small>{account.mailboxId}</small></span></div>
+      <div><Users /><span><strong>Multi-device</strong><small>{account.rootSecret ? `On · this device ${account.deviceId?.slice(0, 8)}…` : "Off"}</small></span></div>
+    </div>
+    {info && <div className="settings-list">
+      <div><Server /><span><strong>Instance</strong><small>{info.instance_name}</small></span></div>
+      <div><ShieldCheck /><span><strong>Protocol</strong><small>v{info.protocol_versions.join(", v")}</small></span></div>
+      <div><Archive /><span><strong>Max message</strong><small>{Math.round(info.maximum_envelope_bytes / 1024)} KB</small></span></div>
+      <div><ShieldCheck /><span><strong>Features</strong><small>{features || "none"}</small></span></div>
+    </div>}
+    <button className="secondary wide" onClick={() => void check()} disabled={state === "checking"}><RefreshCw size={16} /> Recheck</button>
+  </div></Modal>;
+}
+
 function LinkDeviceModal({ setup, onPrepare, onConfirm, onClose }: { setup?: { qr: string; qrImage: string; sas: string }; onPrepare(code: string): void; onConfirm(): void; onClose(): void }) {
   const [offer, setOffer] = useState("");
-  const offerImage = useRef<HTMLInputElement>(null);
   const [scanError, setScanError] = useState("");
-  const scanOffer = async (file?: File) => {
-    if (!file) return;
-    try { setOffer(await scanQr(file)); setScanError(""); }
-    catch (cause) { setScanError(errorMessage(cause, "Could not scan the companion offer.")); }
-  };
-  return <Modal title="Link a companion" onClose={onClose}><div className="modal-content">{!setup ? <><p>Paste or scan the temporary code shown by the companion. It contains no reusable account secret.</p><label>Companion offer<textarea rows={5} value={offer} onChange={(event) => setOffer(event.target.value)} /></label><input ref={offerImage} hidden type="file" accept="image/*" capture="environment" onChange={(event) => void scanOffer(event.target.files?.[0])} /><button className="secondary wide" onClick={() => offerImage.current?.click()}><Hash size={16} /> Scan companion QR</button>{scanError && <p className="form-error"><CircleAlert size={16} />{scanError}</p>}<button className="primary wide" onClick={() => onPrepare(offer)} disabled={!offer.trim()}>Create encrypted response</button></> : <><p>Show this response to the companion, then compare the six-digit code on both devices.</p><img className="pairing-qr" src={setup.qrImage} alt="Encrypted primary pairing response" /><textarea readOnly rows={5} value={setup.qr} /><code>{setup.sas}</code><button className="primary wide" onClick={onConfirm}>Codes match — finish linking</button></>}<button className="secondary wide" onClick={onClose}>Cancel</button></div></Modal>;
+  return <Modal title="Link a companion" onClose={onClose}><div className="modal-content">{!setup ? <><p>Paste or scan the temporary code shown by the companion. It contains no reusable account secret.</p><label>Companion offer<textarea rows={5} value={offer} onChange={(event) => setOffer(event.target.value)} /></label><QrScanControls label="Scan companion QR" onValue={(value) => { setOffer(value); setScanError(""); }} onError={setScanError} />{scanError && <p className="form-error"><CircleAlert size={16} />{scanError}</p>}<button className="primary wide" onClick={() => onPrepare(offer)} disabled={!offer.trim()}>Create encrypted response</button></> : <><p>Show this response to the companion, then compare the six-digit code on both devices.</p><img className="pairing-qr" src={setup.qrImage} alt="Encrypted primary pairing response" /><textarea readOnly rows={5} value={setup.qr} /><code>{setup.sas}</code><button className="primary wide" onClick={onConfirm}>Codes match — finish linking</button></>}<button className="secondary wide" onClick={onClose}>Cancel</button></div></Modal>;
 }
 
 function SecurityModal({ account, contact, onNickname, onBlock, onVerified, onClose }: { account: AccountState; contact: ContactRecord; onNickname(value: string): void; onBlock(): void; onVerified(): void; onClose(): void }) {
@@ -1296,7 +1346,7 @@ function LinkedCompanionMessenger({ initial, passphrase, onLock, onReset }: { in
     <aside className="conversation-sidebar mobile-visible"><header className="workspace-header"><div><span className="eyebrow">LINKED DEVICE</span><h1>{account.instanceName}</h1></div></header><section className="contact-section"><h3>Direct messages<span>{conversations.length}</span></h3>{conversations.map((contact) => <button key={contact.id} className={`contact-row ${selectedId === contact.id ? "active" : ""}`} onClick={() => { setSelectedId(contact.id); if (contact.unread) relay({ type: "mark_read", commandId: crypto.randomUUID(), ts: Date.now(), contactId: contact.id }); }}><span className="avatar small">{initials(contact.localName ?? contact.displayName)}</span><span className="contact-copy"><strong>{contact.localName ?? contact.displayName}</strong><small>{contact.status === "request" ? "Wants to connect" : contact.verified ? "Verified contact" : "Encrypted conversation"}</small></span>{contact.unread > 0 && <span className="unread">{contact.unread}</span>}</button>)}</section><footer><span className={`network-dot ${primaryOffline ? "" : "online"}`} />{primaryOffline ? "Primary offline" : "Synced companion"}</footer></aside>
     <section className="chat-panel mobile-visible">{selected ? <><header className="chat-header"><div className="avatar">{initials(selected.displayName)}</div><div><h2>{selected.localName ?? selected.displayName}</h2><p>{selected.verified ? "Identity verified by primary" : "Relayed through your primary device"}</p></div><span className="chat-spacer" /><button className="icon-button" title="Ask primary to mark verified" disabled={unlinked || selected.verified} onClick={() => relay({ type: "set_verified", commandId: crypto.randomUUID(), ts: Date.now(), contactId: selected.id })}><Fingerprint /></button></header>
       {selected.status === "request" && <div className="request-banner"><div><strong>New message request</strong><span>Accept or block through your primary device.</span></div><button className="secondary" disabled={unlinked} onClick={() => relay({ type: "block_contact", commandId: crypto.randomUUID(), ts: Date.now(), contactId: selected.id })}>Block</button><button className="primary" disabled={unlinked} onClick={() => relay({ type: "accept_request", commandId: crypto.randomUUID(), ts: Date.now(), contactId: selected.id })}>Accept</button></div>}
-      <div className="message-scroll">{messages.map((message) => <div key={message.id} className={`message-row ${message.direction}`}><div className="message-body"><div className="bubble">{message.body}</div>{message.direction === "outgoing" && <span className={`delivery ${message.delivery}`}>{message.delivery.replace("-", " ")}{message.delivery === "failed" && <button className="retry-link" onClick={() => relay({ type: "retry_message", commandId: crypto.randomUUID(), ts: Date.now(), messageId: message.id })}>Retry</button>}</span>}</div></div>)}</div>
+      <div className="message-scroll">{messages.map((message) => <div key={message.id} className={`message-row ${message.direction}`}><div className="message-body"><div className="bubble">{message.body}</div>{message.direction === "outgoing" && <span className={`delivery ${message.delivery}`}>{deliveryLabel(message.delivery)}{message.delivery === "failed" && <button className="retry-link" onClick={() => relay({ type: "retry_message", commandId: crypto.randomUUID(), ts: Date.now(), messageId: message.id })}>Retry</button>}</span>}</div></div>)}</div>
       <div className="composer-wrap"><div className="composer"><textarea value={selected.draft} maxLength={16_384} disabled={unlinked || selected.status === "request"} onChange={(event) => { const next = structuredClone(account); const contact = next.contacts.find((item) => item.id === selected.id); if (contact) contact.draft = event.target.value; setAccount(next); }} onBlur={() => void runLinked(async () => persist(accountRef.current))} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={primaryOffline ? "Queue a message for your primary…" : "Message through primary"} /><button className="send-button" onClick={() => void send()} disabled={unlinked || selected.status === "request" || !selected.draft.trim()}><Send /></button></div></div></> : <div className="empty-chat"><div className="empty-orbit"><MessageCircle /></div><span className="eyebrow">LINKED DEVICE</span><h2>Companion mirror</h2><p>Choose a conversation mirrored from your primary device.</p></div>}</section>
   </main>;
 }

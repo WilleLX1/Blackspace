@@ -3,7 +3,7 @@
 [X] QR Code works
 [ ] Shrink the pairing payload
 [ ] Live camera scanning for QR code detection
-[ ] Multible paired devices
+[X] Multible paired devices
 [ ] Attachments/images
 [ ] Notifications
 [ ] Disappearing messages / retention policy

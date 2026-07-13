@@ -139,6 +139,38 @@ async function portableScan(file: File): Promise<string | undefined> {
   return decodeCanvas(canvas);
 }
 
+// Decode a single live-camera frame. Prefers the platform BarcodeDetector (fast,
+// purpose-built for video); otherwise a downscaled jsQR/ZXing pass. Kept light so
+// it can run on every animation frame without stalling the preview.
+export async function scanQrFrame(video: HTMLVideoElement): Promise<string | undefined> {
+  const width = video.videoWidth;
+  const height = video.videoHeight;
+  if (!width || !height) return undefined;
+  const Detector = (window as unknown as { BarcodeDetector?: BarcodeDetectorConstructor }).BarcodeDetector;
+  if (Detector && typeof createImageBitmap === "function") {
+    try {
+      const bitmap = await createImageBitmap(video);
+      try {
+        const results = await new Detector({ formats: ["qr_code"] }).detect(bitmap);
+        if (results[0]?.rawValue) return results[0].rawValue;
+      } finally {
+        bitmap.close();
+      }
+    } catch {
+      // Fall through to the bundled decoder on partial implementations.
+    }
+  }
+  const scale = Math.min(1, 1_024 / Math.max(width, height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(width * scale));
+  canvas.height = Math.max(1, Math.round(height * scale));
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) return undefined;
+  context.drawImage(video, 0, 0, canvas.width, canvas.height);
+  const image = context.getImageData(0, 0, canvas.width, canvas.height);
+  return decodeQrCandidate(image.data, canvas.width, canvas.height);
+}
+
 export async function scanQr(file: File): Promise<string> {
   const Detector = (window as unknown as { BarcodeDetector?: BarcodeDetectorConstructor }).BarcodeDetector;
   if (Detector) {
