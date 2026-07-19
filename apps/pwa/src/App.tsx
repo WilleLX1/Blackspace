@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import {
   Archive, ArrowLeft, Check, CheckCheck, CircleAlert, Copy, Download,
   Fingerprint, Inbox, KeyRound, Lock, LogOut, MessageCircle, Plus,
-  RefreshCw, Search, Send, Server, Settings, ShieldCheck, UserPlus, Users, X,
+  RefreshCw, Save, Search, Send, Server, Settings, ShieldCheck, Trash2, UserPlus, Users, X,
 } from "lucide-react";
 import QRCode from "qrcode";
 import {
@@ -383,7 +383,7 @@ function Modal({ title, children, onClose }: ModalProps) {
   return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="modal" role="dialog" aria-modal="true"><header><h2>{title}</h2><button className="icon-button" onClick={onClose}><X /></button></header>{children}</section></div>;
 }
 
-function Messenger({ initial, passphrase, onLock }: { initial: AccountState; passphrase: string; onLock(): void }) {
+function Messenger({ initial, passphrase, onLock, onReset }: { initial: AccountState; passphrase: string; onLock(): void; onReset(): void }) {
   const [account, setAccount] = useState(initial);
   const accountRef = useRef(account);
   const [selectedId, setSelectedId] = useState(initial.contacts.find((contact) => contact.status === "accepted")?.id ?? "");
@@ -1129,6 +1129,52 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     await queueMirrorSnapshot();
   };
 
+  const updateDisplayName = async (value: string) => {
+    const displayName = value.trim();
+    if (displayName.length < 2 || displayName.length > 64) throw new Error("Choose a display name between 2 and 64 characters.");
+    await runExclusive(() => mutateState(async (shared) => {
+      if (shared.displayName === displayName) return { changed: false, value: undefined };
+      shared.displayName = displayName;
+      const updates: Array<{ target: DepositTarget; envelope: ReturnType<typeof envelopeForPacket> }> = [];
+      for (const contact of shared.contacts) {
+        if (contact.status !== "accepted" || !contact.mlsGroupId) continue;
+        const content: SecureContent = { version: 1, type: "profile", messageId: crypto.randomUUID(), sentAt: Date.now(), senderIdentity: shared.identityPublicKey, displayName };
+        const encrypted = await mlsCreateMessage(shared.mlsClientState, contact.mlsGroupId, await encodeSecureContent(content));
+        shared.mlsClientState = encrypted.client_state;
+        updates.push({ target: { ...contact.target }, envelope: envelopeForPacket({ kind: "mls", hint: await mlsGroupHint(contact.mlsGroupId), message: encrypted.message }) });
+      }
+      return {
+        changed: true,
+        deferred: async () => {
+          let failures = 0;
+          await Promise.all(updates.map(({ target, envelope }) => depositEnvelope(target, envelope).catch(() => { failures += 1; })));
+          if (failures) setError(`Your display name was saved, but ${failures} contact update${failures === 1 ? "" : "s"} could not be delivered yet.`);
+        },
+        value: undefined,
+      };
+    }));
+    await queueMirrorSnapshot();
+  };
+
+  const clearHistory = async () => {
+    const count = accountRef.current.messages.length;
+    if (!count || !confirm(`Clear ${count} message${count === 1 ? "" : "s"} from this account's synchronized history? Other people may still retain their copies.`)) return;
+    await runExclusive(() => mutateState(async (shared) => {
+      if (!shared.messages.length) return { changed: false, value: undefined };
+      shared.messages = [];
+      return { changed: true, value: undefined };
+    }));
+    await queueMirrorSnapshot();
+  };
+
+  const clearDrafts = async () => {
+    const count = accountRef.current.contacts.filter((contact) => contact.draft).length;
+    if (!count || !confirm(`Clear ${count} saved draft${count === 1 ? "" : "s"} from this device?`)) return;
+    const next = structuredClone(accountRef.current);
+    for (const contact of next.contacts) contact.draft = "";
+    await persist(next);
+  };
+
   const exportRecovery = async () => {
     const recoveryPassphrase = prompt("Choose a separate recovery-kit passphrase (at least 10 characters; this is not your local vault passphrase):"); if (!recoveryPassphrase) return;
     if (recoveryPassphrase.length < 10) { setError("Use at least 10 characters for the recovery-kit passphrase."); return; }
@@ -1181,7 +1227,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     </section>
     {dialog === "add" && <AddContactModal busy={busy} onAdd={addContact} onClose={() => setDialog(null)} />}
     {dialog === "invite" && <InviteModal value={inviteValue} qr={inviteQr} onClose={() => setDialog(null)} />}
-    {dialog === "settings" && <SettingsModal account={account} mode={transportMode ? modeLabel(transportMode) : "Blocked"} online={online} initialSection={settingsSection} devices={devices} onExport={exportRecovery} onLink={() => setDialog("link")} onAddDevice={() => { setAddDeviceSetup(undefined); setDialog("device"); }} onSecureRemove={(id) => void secureRemoveDevice(id).catch((cause) => setError(errorMessage(cause, "Could not securely remove the device.")))} onUnlink={() => void unlinkDevice().catch((cause) => setError(errorMessage(cause, "Could not unlink this device.")))} onLock={onLock} onClose={() => setDialog(null)} />}
+    {dialog === "settings" && <SettingsModal account={account} mode={transportMode ? modeLabel(transportMode) : "Blocked"} online={online} initialSection={settingsSection} devices={devices} onUpdateDisplayName={updateDisplayName} onClearHistory={clearHistory} onClearDrafts={clearDrafts} onExport={exportRecovery} onLink={() => setDialog("link")} onAddDevice={() => { setAddDeviceSetup(undefined); setDialog("device"); }} onSecureRemove={(id) => void secureRemoveDevice(id).catch((cause) => setError(errorMessage(cause, "Could not securely remove the device.")))} onUnlink={() => void unlinkDevice().catch((cause) => setError(errorMessage(cause, "Could not unlink this device.")))} onLock={onLock} onReset={onReset} onClose={() => setDialog(null)} />}
     {dialog === "link" && <LinkDeviceModal setup={linkSetup} onPrepare={(code) => void prepareDeviceLink(code).catch((cause) => setError(errorMessage(cause, "Could not prepare device pairing.")))} onConfirm={() => void confirmDeviceLink().catch((cause) => setError(errorMessage(cause, "Could not finish device pairing.")))} onClose={() => void cancelDeviceLink()} />}
     {dialog === "device" && <DeviceModal setup={addDeviceSetup} onScan={(code) => void addDevice(code).catch((cause) => setError(errorMessage(cause, "Could not prepare secure device enrollment.")))} onApprove={() => void approveDevice().catch((cause) => setError(errorMessage(cause, "Could not approve the device.")))} onClose={() => { setSettingsSection("devices"); setDialog("settings"); setAddDeviceSetup(undefined); }} />}
     {dialog === "security" && selected && <SecurityModal account={account} contact={selected} onNickname={async (nickname) => runExclusive(() => mutateState(async (shared) => { const match = shared.contacts.find((item) => item.id === selected.id); if (match) match.localName = nickname.trim() || undefined; return { changed: Boolean(match), value: undefined }; }))} onBlock={async () => { if (confirm(`Block ${selected.localName ?? selected.displayName} and revoke their mailbox access?`)) { try { await blockContact(selected.id); setDialog(null); } catch (cause) { setError(errorMessage(cause, "Could not block this contact.")); } } }} onVerified={async () => { await runExclusive(() => mutateState(async (shared) => { const match = shared.contacts.find((item) => item.id === selected.id); if (match) match.verified = true; return { changed: Boolean(match), value: undefined }; })); setDialog(null); }} onClose={() => setDialog(null)} />}
@@ -1215,9 +1261,35 @@ function InviteModal({ value, qr, onClose }: { value: string; qr: string; onClos
   return <Modal title="Your contact invitation" onClose={onClose}><div className="invite-modal"><p>Share this invitation with one person through a trusted channel. It grants write-only access to your mailbox.</p>{qr && <img src={qr} alt="Blackspace contact invitation QR code" />}<textarea readOnly value={value} rows={5} /><button className="primary wide" onClick={async () => { await navigator.clipboard.writeText(value); setCopied(true); }}>{copied ? <><Check /> Copied</> : <><Copy /> Copy invitation</>}</button><small>Revoke this invitation if it is exposed or abused.</small></div></Modal>;
 }
 
-function SettingsModal({ account, mode, online, initialSection, devices, onExport, onLink, onAddDevice, onSecureRemove, onUnlink, onLock, onClose }: { account: AccountState; mode: string; online: boolean; initialSection: SettingsSection; devices: DeviceRecord[]; onExport(): void; onLink(): void; onAddDevice(): void; onSecureRemove(id: string): void; onUnlink(): void; onLock(): void; onClose(): void }) {
+interface SettingsModalProps {
+  account: AccountState;
+  mode: string;
+  online: boolean;
+  initialSection: SettingsSection;
+  devices: DeviceRecord[];
+  onUpdateDisplayName(value: string): Promise<void>;
+  onClearHistory(): Promise<void>;
+  onClearDrafts(): Promise<void>;
+  onExport(): void;
+  onLink(): void;
+  onAddDevice(): void;
+  onSecureRemove(id: string): void;
+  onUnlink(): void;
+  onLock(): void;
+  onReset(): void;
+  onClose(): void;
+}
+
+function SettingsModal({ account, mode, online, initialSection, devices, onUpdateDisplayName, onClearHistory, onClearDrafts, onExport, onLink, onAddDevice, onSecureRemove, onUnlink, onLock, onReset, onClose }: SettingsModalProps) {
   const [section, setSection] = useState<SettingsSection>(initialSection);
   const [filter, setFilter] = useState("");
+  const [displayName, setDisplayName] = useState(account.displayName);
+  const [running, setRunning] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [identityCopied, setIdentityCopied] = useState(false);
+
+  useEffect(() => setDisplayName(account.displayName), [account.displayName]);
+  useEffect(() => setActionError(""), [section]);
   const active = devices.filter((device) => !device.revoked);
   const sections: Array<{ id: SettingsSection; label: string; detail: string; icon: ReactNode }> = [
     { id: "account", label: "Account", detail: "Profile and identity", icon: <KeyRound /> },
@@ -1228,6 +1300,12 @@ function SettingsModal({ account, mode, online, initialSection, devices, onExpor
   ];
   const visibleSections = sections.filter((item) => `${item.label} ${item.detail}`.toLowerCase().includes(filter.toLowerCase()));
   const row = (label: string, value: string, icon: ReactNode) => <div className="settings-value-row">{icon}<span><strong>{label}</strong><small>{value}</small></span></div>;
+  const run = async (name: string, action: () => Promise<void>) => {
+    setRunning(name); setActionError("");
+    try { await action(); }
+    catch (cause) { setActionError(errorMessage(cause, "The setting could not be changed.")); }
+    finally { setRunning(""); }
+  };
 
   return <div className="modal-backdrop settings-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
     <section className="settings-window" role="dialog" aria-modal="true" aria-label="Settings">
@@ -1242,13 +1320,14 @@ function SettingsModal({ account, mode, online, initialSection, devices, onExpor
         <header><div><span className="eyebrow">BLACKSPACE SETTINGS</span><h2>{sections.find((item) => item.id === section)?.label}</h2></div><button className="icon-button" onClick={onClose} aria-label="Close settings"><X /></button></header>
         <div className="settings-scroll">
           {section === "account" && <section className="settings-page">
-            <div className="settings-page-heading"><div className="modal-icon"><KeyRound /></div><div><h3>Account and identity</h3><p>Your public profile and cryptographic identity. Blackspace does not require email or a phone number.</p></div></div>
-            <div className="settings-card">
-              {row("Display name", account.displayName, <MessageCircle />)}
-              {row("Instance", account.instanceName, <Server />)}
-              {row("Identity key", `${account.identityPublicKey.slice(0, 24)}…`, <Fingerprint />)}
-              {row("Local vault", "Encrypted with your app-lock passphrase", <Lock />)}
+            <div className="settings-page-heading"><div className="modal-icon"><KeyRound /></div><div><h3>Account and identity</h3><p>Change how contacts see you and manage the public identity information you share.</p></div></div>
+            <div className="settings-card settings-edit-card">
+              <label>Display name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} minLength={2} maxLength={64} /></label>
+              <p>Saving updates the encrypted shared account state and sends a signed profile update to established contacts.</p>
+              <button className="primary" disabled={running === "name" || displayName.trim() === account.displayName || displayName.trim().length < 2} onClick={() => void run("name", () => onUpdateDisplayName(displayName))}><Save />{running === "name" ? "Saving…" : "Save display name"}</button>
             </div>
+            <div className="settings-card settings-action-card settings-followup-card"><div><Fingerprint /><span><strong>Public identity key</strong><small>{account.identityPublicKey.slice(0, 32)}…</small></span><button className="secondary" onClick={() => void navigator.clipboard.writeText(account.identityPublicKey).then(() => setIdentityCopied(true)).catch((cause) => setActionError(errorMessage(cause, "Could not copy the identity key.")))}>{identityCopied ? <><Check /> Copied</> : <><Copy /> Copy</>}</button></div><div><Server /><span><strong>Home instance</strong><small>{account.instanceName}</small></span></div></div>
+            {actionError && <p className="settings-inline-error"><CircleAlert />{actionError}</p>}
           </section>}
           {section === "devices" && <section className="settings-page">
             <div className="settings-page-heading"><div className="modal-icon secure"><Users /></div><div><h3>Authorized devices</h3><p>New devices receive account secrets only after both screens show the same security code and you approve here.</p></div></div>
@@ -1263,13 +1342,10 @@ function SettingsModal({ account, mode, online, initialSection, devices, onExpor
             <p className="settings-security-note"><ShieldCheck /> Secure removal rotates mailbox read/admin access and the shared-state encryption key. Protocol v1 signs out every other full device so trusted ones can be enrolled again. A stolen device may retain data it already decrypted.</p>
           </section>}
           {section === "privacy" && <section className="settings-page">
-            <div className="settings-page-heading"><div className="modal-icon secure"><ShieldCheck /></div><div><h3>Privacy and local data</h3><p>Review what Blackspace stores and which metadata the mailbox can observe.</p></div></div>
-            <div className="settings-card">
-              {row("Message content", "End-to-end encrypted before leaving this device", <Lock />)}
-              {row("Local history", "Stored inside the encrypted vault", <Archive />)}
-              {row("Mailbox metadata", "Timing, size class, expiry and capability use", <Server />)}
-              {row("Browser erasure", "Physical erasure of old encrypted pages is not guaranteed", <CircleAlert />)}
-            </div>
+            <div className="settings-page-heading"><div className="modal-icon secure"><ShieldCheck /></div><div><h3>Privacy and local data</h3><p>Control synchronized conversation history and device-local compose drafts.</p></div></div>
+            <div className="settings-card settings-action-card"><div><Trash2 /><span><strong>Clear message history</strong><small>{account.messages.length ? `${account.messages.length} message${account.messages.length === 1 ? "" : "s"} across enrolled devices` : "No saved messages"}</small></span><button className="secondary danger-action" disabled={!account.messages.length || running === "history"} onClick={() => void run("history", onClearHistory)}>{running === "history" ? "Clearing…" : "Clear history"}</button></div><div><MessageCircle /><span><strong>Clear saved drafts</strong><small>{account.contacts.filter((contact) => contact.draft).length ? `${account.contacts.filter((contact) => contact.draft).length} device-local conversation draft${account.contacts.filter((contact) => contact.draft).length === 1 ? "" : "s"}` : "No device-local drafts"}</small></span><button className="secondary" disabled={!account.contacts.some((contact) => contact.draft) || running === "drafts"} onClick={() => void run("drafts", onClearDrafts)}>{running === "drafts" ? "Clearing…" : "Clear drafts"}</button></div></div>
+            <p className="settings-security-note"><CircleAlert /> Clearing synchronized history cannot erase messages another person retained, and browser or SSD storage cannot guarantee physical erasure of old encrypted pages. The mailbox can still observe timing, size class, expiry and capability use.</p>
+            {actionError && <p className="settings-inline-error"><CircleAlert />{actionError}</p>}
           </section>}
           {section === "network" && <section className="settings-page">
             <div className="settings-page-heading"><div className="modal-icon"><Server /></div><div><h3>Network and transport</h3><p>Blackspace keeps Tor and HTTPS transport modes separate and never silently falls back.</p></div></div>
@@ -1284,7 +1360,7 @@ function SettingsModal({ account, mode, online, initialSection, devices, onExpor
           </section>}
           {section === "recovery" && <section className="settings-page">
             <div className="settings-page-heading"><div className="modal-icon"><Archive /></div><div><h3>Recovery and access</h3><p>Recovery kits are encrypted client exports. The server cannot recover a lost identity or passphrase.</p></div></div>
-            <div className="settings-card settings-action-card"><div><Download /><span><strong>Encrypted recovery kit</strong><small>Preserves your identity and history for mailbox takeover recovery.</small></span><button className="secondary" onClick={onExport}>Export</button></div><div><LogOut /><span><strong>Lock this device</strong><small>Clears unlocked key material from the running application.</small></span><button className="secondary" onClick={onLock}>Lock now</button></div></div>
+            <div className="settings-card settings-action-card"><div><Download /><span><strong>Encrypted recovery kit</strong><small>Preserves your identity and history for mailbox takeover recovery.</small></span><button className="secondary" onClick={onExport}>Export</button></div><div><LogOut /><span><strong>Lock this device</strong><small>Clears unlocked key material from the running application.</small></span><button className="secondary" onClick={onLock}>Lock now</button></div><div><Trash2 /><span><strong>Remove from this device</strong><small>Deletes this device's encrypted local vault. It does not delete the mailbox or data on other devices.</small></span><button className="secondary danger-action" onClick={onReset}>Remove</button></div></div>
           </section>}
         </div>
       </div>
@@ -1510,5 +1586,5 @@ export default function App() {
   if (screen === "locked") return <LockedScreen onUnlock={(state, password) => { setAccount(state); setPassphrase(password); setScreen("messenger"); }} onReset={async () => { if (confirm("Delete the encrypted Blackspace vault from this browser?")) { await deleteVault(); setScreen("welcome"); } }} />;
   if (!account) return null;
   if (account.role === "companion") return <LinkedCompanionMessenger initial={account} passphrase={passphrase} onLock={() => { lockVault(); setAccount(null); setPassphrase(""); setScreen("locked"); }} onReset={() => void (async () => { if (confirm("Delete this encrypted companion mirror from this browser?")) { await deleteVault(); setAccount(null); setPassphrase(""); setScreen("welcome"); } })()} />;
-  return <Messenger initial={account} passphrase={passphrase} onLock={() => { lockVault(); setAccount(null); setPassphrase(""); setScreen("locked"); }} />;
+  return <Messenger initial={account} passphrase={passphrase} onLock={() => { lockVault(); setAccount(null); setPassphrase(""); setScreen("locked"); }} onReset={() => void (async () => { if (confirm("Remove this account and its encrypted local data from this device? Export a recovery kit first if this is your only full device.")) { await deleteVault(); setAccount(null); setPassphrase(""); setScreen("welcome"); } })()} />;
 }
