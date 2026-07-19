@@ -64,6 +64,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/enroll/parcels/{parcel_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["api_finalize_enrollment_parcel"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/info": {
         parameters: {
             query?: never;
@@ -144,7 +160,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/mailbox/devices/{device_id}": {
+    "/v1/mailbox/devices/secure-reset": {
         parameters: {
             query?: never;
             header?: never;
@@ -153,8 +169,8 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        post?: never;
-        delete: operations["api_revoke_device"];
+        post: operations["api_secure_device_reset"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -268,10 +284,11 @@ export interface components {
             acknowledged: number;
         };
         ClaimEnrollmentParcelResponseV1: {
-            ciphertext: string;
+            ciphertext?: string | null;
             eph_pub: string;
-            nonce: string;
-            size_class: number;
+            nonce?: string | null;
+            size_class?: number | null;
+            status: components["schemas"]["EnrollmentParcelStatusV1"];
         };
         ClaimKeyPackageResponseV1: {
             key_package: components["schemas"]["KeyPackageV1"];
@@ -301,6 +318,8 @@ export interface components {
             label: string;
             revoked: boolean;
         };
+        /** @enum {string} */
+        EnrollmentParcelStatusV1: "pending_confirmation" | "ready";
         EnvelopeV1: {
             ciphertext: string;
             /** Format: uuid */
@@ -323,6 +342,15 @@ export interface components {
             opaque_transport: boolean;
             recovery_takeover: boolean;
             registration_invites: boolean;
+        };
+        /**
+         * @description Stage two of enrollment, uploaded only after the trusted device confirms the
+         *     SAS. The payload is encrypted to the new device's ephemeral public key.
+         */
+        FinalizeEnrollmentParcelRequestV1: {
+            ciphertext: string;
+            nonce: string;
+            size_class: number;
         };
         /**
          * @description An opaque, client-signed MLS key package. The mailbox validates bounds and
@@ -369,18 +397,15 @@ export interface components {
             version: number;
         };
         /**
-         * @description A one-time enrollment parcel parked by an already-enrolled device for a new
-         *     device to claim. The ciphertext is sealed to the new device's ephemeral public
-         *     key (carried in `eph_pub`); the server sees only opaque bytes and never a secret.
+         * @description Stage one of enrollment. Only the trusted device's ephemeral public key is
+         *     parked here. No reusable account secret is uploaded until both screens have
+         *     displayed the same short-authentication string and the trusted user approves.
          */
         ParkEnrollmentParcelRequestV1: {
-            ciphertext: string;
             eph_pub: string;
             /** Format: int64 */
             expires_at: number;
-            nonce: string;
             parcel_verifier: string;
-            size_class: number;
         };
         ParkEnrollmentParcelResponseV1: {
             /** Format: uuid */
@@ -463,6 +488,28 @@ export interface components {
         };
         RotateReadCapabilityResponseV1: {
             ok: boolean;
+        };
+        /**
+         * @description Atomically replaces the shared mailbox credentials and re-encrypts the shared
+         *     MLS state under a new account root. Because v1 devices share mailbox-wide
+         *     credentials, every device except the caller is revoked and must be re-enrolled.
+         */
+        SecureDeviceResetRequestV1: {
+            admin_capability_verifier: string;
+            /** Format: uuid */
+            current_device_id: string;
+            /** Format: int64 */
+            expected_mls_state_version: number;
+            mls_state_ciphertext: string;
+            mls_state_size_class: number;
+            read_capability_verifier: string;
+            revoke_deposit_capability_ids?: string[];
+        };
+        SecureDeviceResetResponseV1: {
+            /** Format: int64 */
+            revoked_devices: number;
+            /** Format: int64 */
+            version: number;
         };
         ServerInfoV1: {
             /** Format: int64 */
@@ -607,6 +654,45 @@ export interface operations {
                 };
             };
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemV1"];
+                };
+            };
+        };
+    };
+    api_finalize_enrollment_parcel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                parcel_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FinalizeEnrollmentParcelRequestV1"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemV1"];
+                };
+            };
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -780,24 +866,36 @@ export interface operations {
             };
         };
     };
-    api_revoke_device: {
+    api_secure_device_reset: {
         parameters: {
             query?: never;
             header?: never;
-            path: {
-                device_id: string;
-            };
+            path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SecureDeviceResetRequestV1"];
+            };
+        };
         responses: {
-            204: {
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["SecureDeviceResetResponseV1"];
+                };
             };
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemV1"];
+                };
+            };
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -47,6 +47,14 @@ export async function serverInfo(origin: string): Promise<ServerInfo> {
   return jsonRequest(origin, "/v1/info");
 }
 
+// Diagnostics deliberately keep these probes separate. In the native client,
+// the Tor probe stays behind the managed SOCKS boundary while the HTTPS probe
+// uses a dedicated HTTPS-only command; neither path is used as a delivery fallback.
+export async function diagnosticServerInfo(origin: string, transport: "tor" | "https"): Promise<ServerInfo> {
+  if (isTauri()) return invoke(transport === "tor" ? "get_server_info" : "get_https_server_info", { serverUrl: origin });
+  return jsonRequest(origin, "/v1/info");
+}
+
 export async function provisionMailbox(origin: string, registrationToken: string, request: object): Promise<{ mailbox_id: string; initial_deposit_capability_id: string }> {
   if (isTauri()) return invoke("provision_mailbox", { serverUrl: origin, registrationToken, request });
   return jsonRequest(origin, "/v1/mailboxes", {
@@ -172,15 +180,30 @@ export async function parkEnrollmentParcel(origin: string, adminCapability: stri
   });
 }
 
-export async function claimEnrollmentParcel(origin: string, claimSecret: string): Promise<{ eph_pub: string; nonce: string; size_class: number; ciphertext: string } | undefined> {
-  if (isTauri()) return (await invoke<{ eph_pub: string; nonce: string; size_class: number; ciphertext: string } | null>("claim_enrollment_parcel", { serverUrl: origin, claimSecret })) ?? undefined;
+export async function finalizeEnrollmentParcel(origin: string, adminCapability: string, parcelId: string, parcel: object): Promise<void> {
+  if (isTauri()) { await invoke("finalize_enrollment_parcel", { serverUrl: origin, adminCapability, parcelId, request: parcel }); return; }
+  await noContentRequest(origin, `/v1/enroll/parcels/${encodeURIComponent(parcelId)}`, {
+    method: "PUT", headers: { "content-type": "application/json", authorization: `BlackspaceAdmin ${adminCapability}` }, body: JSON.stringify(parcel),
+  });
+}
+
+export interface EnrollmentParcelClaim {
+  status: "pending_confirmation" | "ready";
+  eph_pub: string;
+  nonce?: string;
+  size_class?: number;
+  ciphertext?: string;
+}
+
+export async function claimEnrollmentParcel(origin: string, claimSecret: string): Promise<EnrollmentParcelClaim | undefined> {
+  if (isTauri()) return (await invoke<EnrollmentParcelClaim | null>("claim_enrollment_parcel", { serverUrl: origin, claimSecret })) ?? undefined;
   const response = await fetch(`${origin}/v1/enroll/parcels/claim`, {
     method: "POST", redirect: "error", credentials: "omit", cache: "no-store",
     headers: { authorization: `BlackspaceEnroll ${claimSecret}` },
   });
   if (response.status === 404) return undefined;
   if (!response.ok) throw new MailboxOperationError(response.status);
-  return JSON.parse(await response.text()) as { eph_pub: string; nonce: string; size_class: number; ciphertext: string };
+  return JSON.parse(await response.text()) as EnrollmentParcelClaim;
 }
 
 export async function registerDevice(origin: string, adminCapability: string, deviceId: string, label: string): Promise<void> {
@@ -200,9 +223,28 @@ export async function listDevices(origin: string, adminCapability: string): Prom
   return response.devices;
 }
 
-export async function revokeDevice(origin: string, adminCapability: string, deviceId: string): Promise<void> {
-  if (isTauri()) { await invoke("revoke_device", { serverUrl: origin, adminCapability, deviceId }); return; }
-  await noContentRequest(origin, `/v1/mailbox/devices/${encodeURIComponent(deviceId)}`, {
-    method: "DELETE", headers: { authorization: `BlackspaceAdmin ${adminCapability}` },
+export interface SecureDeviceResetRequest {
+  current_device_id: string;
+  read_capability_verifier: string;
+  admin_capability_verifier: string;
+  revoke_deposit_capability_ids: string[];
+  expected_mls_state_version: number;
+  mls_state_size_class: number;
+  mls_state_ciphertext: string;
+}
+
+export async function secureDeviceReset(origin: string, adminCapability: string, request: SecureDeviceResetRequest): Promise<{ version: number; revoked_devices: number } | "conflict"> {
+  if (isTauri()) {
+    const result = await invoke<{ conflict: boolean; version?: number; revoked_devices?: number }>("secure_device_reset", { serverUrl: origin, adminCapability, request });
+    if (result.conflict || result.version === undefined) return "conflict";
+    return { version: result.version, revoked_devices: result.revoked_devices ?? 0 };
+  }
+  const response = await fetch(`${origin}/v1/mailbox/devices/secure-reset`, {
+    method: "POST", redirect: "error", credentials: "omit", cache: "no-store",
+    headers: { "content-type": "application/json", authorization: `BlackspaceAdmin ${adminCapability}` },
+    body: JSON.stringify(request),
   });
+  if (response.status === 409) return "conflict";
+  if (!response.ok) throw new MailboxOperationError(response.status);
+  return JSON.parse(await response.text()) as { version: number; revoked_devices: number };
 }

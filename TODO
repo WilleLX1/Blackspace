@@ -2,7 +2,7 @@
 [X] Abunch of 401 errors on HTTPS web PWA
 [X] QR Code works
 [ ] Shrink the pairing payload
-[ ] Live camera scanning for QR code detection
+[X] Live camera scanning for QR code detection
 [X] Multible paired devices
 [ ] Attachments/images
 [ ] Notifications

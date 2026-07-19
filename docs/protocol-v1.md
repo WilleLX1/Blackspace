@@ -29,3 +29,11 @@ Only server information, key-package claim, and deposit permit credentialless br
 ## Recovery
 
 Recovery kits are encrypted client exports, not server backups. Mailbox takeover rotates read/admin/deposit capabilities, revokes old deposit capabilities, purges queued envelopes and key packages, and installs fresh packages. Clients reset secure sessions rather than resuming stale sending state.
+
+## Full-device enrollment
+
+Full-device enrollment is a staged, one-scan exchange. `POST /v1/enroll/parcels` parks only the trusted device's ephemeral public key and the one-time parcel verifier. A claimant polling `POST /v1/enroll/parcels/claim` receives `pending_confirmation` plus that public key and can derive the same short-authentication string, but no reusable account secret is present yet. After the operator compares both screens and explicitly approves, the trusted device encrypts the padded account bundle and uploads it with `PUT /v1/enroll/parcels/{parcel_id}`. The next claim returns `ready` and atomically consumes the parcel.
+
+## Secure device reset
+
+Protocol v1 full devices share mailbox capabilities and the account-root key, so removing one device safely must sign out all other full devices. `POST /v1/mailbox/devices/secure-reset` is administrator-authenticated and atomically compares the MLS-state version, rotates the read and administrator verifiers, installs a blob encrypted under a fresh client root, revokes all registered devices except `current_device_id`, and optionally revokes linked-companion deposit capabilities. A version conflict changes nothing and the client must re-read, re-encrypt, and retry.

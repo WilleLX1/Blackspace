@@ -1,17 +1,17 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::IpAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use blackspace_core::MlsIdentityV1;
 use blackspace_protocol::{
     AckRequestV1, AckResponseV1, ClaimEnrollmentParcelResponseV1, ClaimKeyPackageResponseV1,
     CreateDepositCapabilityRequestV1, CreateDepositCapabilityResponseV1, DepositAcceptedV1,
-    DepositTargetV1, EnvelopeV1, ListDevicesResponseV1, MailboxProvisionRequestV1,
-    MailboxProvisionResponseV1, MlsStateResponseV1, ParkEnrollmentParcelRequestV1,
-    ParkEnrollmentParcelResponseV1, ProblemV1, PublishKeyPackagesRequestV1,
-    PublishKeyPackagesResponseV1, PullRequestV1, PullResponseV1, PutMlsStateRequestV1,
-    PutMlsStateResponseV1, RecoverMailboxRequestV1, RecoverMailboxResponseV1,
+    DepositTargetV1, EnvelopeV1, FinalizeEnrollmentParcelRequestV1, ListDevicesResponseV1,
+    MailboxProvisionRequestV1, MailboxProvisionResponseV1, MlsStateResponseV1,
+    ParkEnrollmentParcelRequestV1, ParkEnrollmentParcelResponseV1, ProblemV1,
+    PublishKeyPackagesRequestV1, PublishKeyPackagesResponseV1, PullRequestV1, PullResponseV1,
+    PutMlsStateRequestV1, PutMlsStateResponseV1, RecoverMailboxRequestV1, RecoverMailboxResponseV1,
     RegisterDeviceRequestV1, RotateReadCapabilityRequestV1, RotateReadCapabilityResponseV1,
-    ServerInfoV1,
+    SecureDeviceResetRequestV1, SecureDeviceResetResponseV1, ServerInfoV1,
 };
 use blackspace_tor::{
     parse_bootstrap_progress, parse_control_port_file, parse_socks_listener,
@@ -27,9 +27,10 @@ use tauri_plugin_shell::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpStream, lookup_host},
     sync::Mutex,
 };
+use url::{Host, Url};
 
 mod native_vault;
 use native_vault::NativeVault;
@@ -79,6 +80,13 @@ struct NativeIdentityPublic {
 struct NativePutMlsStateResponse {
     conflict: bool,
     version: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct NativeSecureDeviceResetResponse {
+    conflict: bool,
+    version: Option<i64>,
+    revoked_devices: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -461,6 +469,109 @@ fn safe_request_error(error: reqwest::Error) -> String {
     }
 }
 
+fn validate_https_origin(value: &str) -> Result<String, String> {
+    let url = Url::parse(value).map_err(|_| "Invalid HTTPS diagnostic origin.".to_string())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("HTTPS diagnostics require a bare https:// origin.".to_string());
+    }
+    match url.host() {
+        Some(Host::Domain(host))
+            if host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".localhost") =>
+        {
+            return Err("HTTPS diagnostics do not permit local destinations.".to_string());
+        }
+        Some(Host::Ipv4(address)) if !is_public_https_address(IpAddr::V4(address)) => {
+            return Err("HTTPS diagnostics do not permit local destinations.".to_string());
+        }
+        Some(Host::Ipv6(address)) if !is_public_https_address(IpAddr::V6(address)) => {
+            return Err("HTTPS diagnostics do not permit local destinations.".to_string());
+        }
+        _ => {}
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+fn is_public_https_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            !(address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_broadcast()
+                || address.is_multicast())
+        }
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return is_public_https_address(IpAddr::V4(mapped));
+            }
+            !(address.is_loopback()
+                || address.is_unspecified()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || address.is_multicast())
+        }
+    }
+}
+
+async fn https_diagnostic_client(origin: &str) -> Result<Client, String> {
+    let url = Url::parse(origin).map_err(|_| "Invalid HTTPS diagnostic origin.".to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "Invalid HTTPS diagnostic origin.".to_string())?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addresses = lookup_host((host, port))
+        .await
+        .map_err(|_| "Could not resolve the HTTPS gateway.".to_string())?
+        .collect::<Vec<_>>();
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| !is_public_https_address(address.ip()))
+    {
+        return Err("HTTPS diagnostics do not permit local destinations.".to_string());
+    }
+    Client::builder()
+        .redirect(Policy::none())
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(30))
+        .resolve_to_addrs(host, &addresses)
+        .build()
+        .map_err(|_| "Could not initialize the HTTPS diagnostic client.".to_string())
+}
+
+fn safe_https_request_error(error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        "HTTPS request timed out.".to_string()
+    } else if error.is_connect() {
+        "Could not connect to the HTTPS gateway.".to_string()
+    } else if error.is_decode() {
+        "Mailbox returned an invalid response.".to_string()
+    } else {
+        "HTTPS diagnostic request failed.".to_string()
+    }
+}
+
+async fn request_https_json<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+) -> Result<T, String> {
+    let response = request.send().await.map_err(safe_https_request_error)?;
+    let status = response.status();
+    if !status.is_success() {
+        let problem = response.json::<ProblemV1>().await.ok();
+        return Err(safe_mailbox_error(status.as_u16(), problem.as_ref()));
+    }
+    response.json().await.map_err(safe_https_request_error)
+}
+
 async fn request_json<T: serde::de::DeserializeOwned>(
     request: reqwest::RequestBuilder,
 ) -> Result<T, String> {
@@ -513,6 +624,13 @@ async fn get_server_info(
 ) -> Result<ServerInfoV1, String> {
     let (client, origin) = tor_client(&manager, &server_url).await?;
     request_json(client.get(format!("{origin}/v1/info"))).await
+}
+
+#[tauri::command]
+async fn get_https_server_info(server_url: String) -> Result<ServerInfoV1, String> {
+    let origin = validate_https_origin(&server_url)?;
+    let client = https_diagnostic_client(&origin).await?;
+    request_https_json(client.get(format!("{origin}/v1/info"))).await
 }
 
 #[tauri::command]
@@ -810,6 +928,29 @@ async fn park_enrollment_parcel(
 }
 
 #[tauri::command]
+async fn finalize_enrollment_parcel(
+    manager: State<'_, Arc<TorManager>>,
+    server_url: String,
+    admin_capability: String,
+    parcel_id: String,
+    request: FinalizeEnrollmentParcelRequestV1,
+) -> Result<(), String> {
+    let id = uuid::Uuid::parse_str(&parcel_id)
+        .map_err(|_| "Invalid enrollment parcel identifier.".to_string())?;
+    let (client, origin) = tor_client(&manager, &server_url).await?;
+    request_no_content(
+        client
+            .put(format!("{origin}/v1/enroll/parcels/{id}"))
+            .header(
+                "authorization",
+                format!("BlackspaceAdmin {admin_capability}"),
+            )
+            .json(&request),
+    )
+    .await
+}
+
+#[tauri::command]
 async fn claim_enrollment_parcel(
     manager: State<'_, Arc<TorManager>>,
     server_url: String,
@@ -872,24 +1013,44 @@ async fn list_devices(
 }
 
 #[tauri::command]
-async fn revoke_device(
+async fn secure_device_reset(
     manager: State<'_, Arc<TorManager>>,
     server_url: String,
     admin_capability: String,
-    device_id: String,
-) -> Result<(), String> {
-    let id =
-        uuid::Uuid::parse_str(&device_id).map_err(|_| "Invalid device identifier.".to_string())?;
+    request: SecureDeviceResetRequestV1,
+) -> Result<NativeSecureDeviceResetResponse, String> {
     let (client, origin) = tor_client(&manager, &server_url).await?;
-    request_no_content(
-        client
-            .delete(format!("{origin}/v1/mailbox/devices/{id}"))
-            .header(
-                "authorization",
-                format!("BlackspaceAdmin {admin_capability}"),
-            ),
-    )
-    .await
+    let response = client
+        .post(format!("{origin}/v1/mailbox/devices/secure-reset"))
+        .header(
+            "authorization",
+            format!("BlackspaceAdmin {admin_capability}"),
+        )
+        .json(&request)
+        .send()
+        .await
+        .map_err(safe_request_error)?;
+    if response.status() == reqwest::StatusCode::CONFLICT {
+        return Ok(NativeSecureDeviceResetResponse {
+            conflict: true,
+            version: None,
+            revoked_devices: None,
+        });
+    }
+    let status = response.status();
+    if !status.is_success() {
+        let problem = response.json::<ProblemV1>().await.ok();
+        return Err(safe_mailbox_error(status.as_u16(), problem.as_ref()));
+    }
+    let result = response
+        .json::<SecureDeviceResetResponseV1>()
+        .await
+        .map_err(safe_request_error)?;
+    Ok(NativeSecureDeviceResetResponse {
+        conflict: false,
+        version: Some(result.version),
+        revoked_devices: Some(result.revoked_devices),
+    })
 }
 
 pub fn run() {
@@ -919,6 +1080,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             tor_status,
             get_server_info,
+            get_https_server_info,
             provision_mailbox,
             create_deposit_capability,
             revoke_deposit_capability,
@@ -939,10 +1101,11 @@ pub fn run() {
             get_mls_state,
             put_mls_state,
             park_enrollment_parcel,
+            finalize_enrollment_parcel,
             claim_enrollment_parcel,
             register_device,
             list_devices,
-            revoke_device,
+            secure_device_reset,
         ])
         .on_window_event({
             move |_window, event| {
@@ -993,6 +1156,24 @@ mod tests {
             safe_mailbox_error(418, Some(&unknown)),
             "Mailbox operation failed with status 418."
         );
+    }
+
+    #[test]
+    fn https_diagnostics_accept_only_bare_https_origins() {
+        assert_eq!(
+            validate_https_origin("https://example.com").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(
+            validate_https_origin("https://example.com:8443/").unwrap(),
+            "https://example.com:8443"
+        );
+        assert!(validate_https_origin("http://example.com").is_err());
+        assert!(validate_https_origin("https://user@example.com").is_err());
+        assert!(validate_https_origin("https://example.com/path").is_err());
+        assert!(validate_https_origin("https://localhost").is_err());
+        assert!(validate_https_origin("https://127.0.0.1").is_err());
+        assert!(validate_https_origin("https://[::1]").is_err());
     }
 
     #[tokio::test]

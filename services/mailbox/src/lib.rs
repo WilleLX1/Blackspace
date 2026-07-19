@@ -20,14 +20,15 @@ use blackspace_capabilities::{CapabilityKind, decode_verifier, generate_capabili
 use blackspace_protocol::{
     AckRequestV1, AckResponseV1, ClaimEnrollmentParcelResponseV1, ClaimKeyPackageResponseV1,
     CreateDepositCapabilityRequestV1, CreateDepositCapabilityResponseV1, DepositAcceptedV1,
-    DeviceV1, EnvelopeV1, KeyPackageV1, ListDevicesResponseV1, MAX_KEY_PACKAGE_BATCH,
-    MAX_PULL_BATCH, MAX_QUEUED_ENVELOPES, MAX_RETENTION_SECONDS, MLS_STATE_SIZE_CLASSES,
-    MailboxProvisionRequestV1, MailboxProvisionResponseV1, MlsStateResponseV1,
-    ParkEnrollmentParcelRequestV1, ParkEnrollmentParcelResponseV1, ProblemV1,
-    PublishKeyPackagesRequestV1, PublishKeyPackagesResponseV1, PullRequestV1, PullResponseV1,
-    PulledEnvelopeV1, PutMlsStateRequestV1, PutMlsStateResponseV1, RecoverMailboxRequestV1,
-    RecoverMailboxResponseV1, RegisterDeviceRequestV1, RotateReadCapabilityRequestV1,
-    RotateReadCapabilityResponseV1, SIZE_CLASSES, ServerInfoV1,
+    DeviceV1, EnrollmentParcelStatusV1, EnvelopeV1, FinalizeEnrollmentParcelRequestV1,
+    KeyPackageV1, ListDevicesResponseV1, MAX_KEY_PACKAGE_BATCH, MAX_PULL_BATCH,
+    MAX_QUEUED_ENVELOPES, MAX_RETENTION_SECONDS, MLS_STATE_SIZE_CLASSES, MailboxProvisionRequestV1,
+    MailboxProvisionResponseV1, MlsStateResponseV1, ParkEnrollmentParcelRequestV1,
+    ParkEnrollmentParcelResponseV1, ProblemV1, PublishKeyPackagesRequestV1,
+    PublishKeyPackagesResponseV1, PullRequestV1, PullResponseV1, PulledEnvelopeV1,
+    PutMlsStateRequestV1, PutMlsStateResponseV1, RecoverMailboxRequestV1, RecoverMailboxResponseV1,
+    RegisterDeviceRequestV1, RotateReadCapabilityRequestV1, RotateReadCapabilityResponseV1,
+    SIZE_CLASSES, SecureDeviceResetRequestV1, SecureDeviceResetResponseV1, ServerInfoV1,
 };
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use subtle::ConstantTimeEq;
@@ -319,8 +320,15 @@ pub fn router(state: AppState) -> Router {
             "/v1/mailbox/devices",
             get(list_devices).post(register_device),
         )
-        .route("/v1/mailbox/devices/{device_id}", delete(revoke_device))
+        .route(
+            "/v1/mailbox/devices/secure-reset",
+            post(secure_device_reset),
+        )
         .route("/v1/enroll/parcels", post(park_enrollment_parcel))
+        .route(
+            "/v1/enroll/parcels/{parcel_id}",
+            axum::routing::put(finalize_enrollment_parcel),
+        )
         .route("/v1/enroll/parcels/claim", post(claim_enrollment_parcel))
         .route("/v1/deposit/key-packages/claim", post(claim_key_package))
         .route("/v1/deposit/envelopes", post(deposit_envelope))
@@ -655,9 +663,9 @@ async fn put_mls_state(
     Ok(Json(PutMlsStateResponseV1 { version: next }))
 }
 
-/// Park a one-time enrollment parcel for a new device. Admin-gated (only an already
-/// enrolled device enrolls another). The ciphertext is sealed to the new device's
-/// ephemeral key; the server stores opaque bytes.
+/// Begin a one-time enrollment ceremony. This first stage deliberately stores no
+/// account ciphertext: it gives the new device only the trusted device's ephemeral
+/// public key so both screens can authenticate the channel before secrets move.
 async fn park_enrollment_parcel(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -673,13 +681,10 @@ async fn park_enrollment_parcel(
     .await?;
     let verifier =
         decode_verifier(&request.parcel_verifier).map_err(|_| ApiError::invalid_request())?;
-    let ciphertext =
-        validate_sized_ciphertext(&request.ciphertext, request.size_class, &SIZE_CLASSES)?;
-    if request.eph_pub.len() > 128
-        || request.nonce.len() > 64
-        || URL_SAFE_NO_PAD.decode(&request.eph_pub).is_err()
-        || URL_SAFE_NO_PAD.decode(&request.nonce).is_err()
-    {
+    let eph_pub = URL_SAFE_NO_PAD
+        .decode(&request.eph_pub)
+        .map_err(|_| ApiError::invalid_request())?;
+    if eph_pub.len() != 65 || URL_SAFE_NO_PAD.encode(eph_pub) != request.eph_pub {
         return Err(ApiError::invalid_request());
     }
     let expires_at = OffsetDateTime::from_unix_timestamp(request.expires_at)
@@ -690,16 +695,13 @@ async fn park_enrollment_parcel(
     }
     let parcel_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO enrollment_parcels (id, mailbox_id, verifier, eph_pub, nonce, size_class, ciphertext, expires_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        "INSERT INTO enrollment_parcels (id, mailbox_id, verifier, eph_pub, expires_at)
+         VALUES ($1,$2,$3,$4,$5)",
     )
     .bind(parcel_id)
     .bind(mailbox_id)
     .bind(verifier.as_slice())
     .bind(&request.eph_pub)
-    .bind(&request.nonce)
-    .bind(request.size_class as i32)
-    .bind(ciphertext)
     .bind(expires_at)
     .execute(&state.pool)
     .await
@@ -710,8 +712,53 @@ async fn park_enrollment_parcel(
     ))
 }
 
-/// Claim an enrollment parcel once, authenticated by the bearer secret carried in
-/// the enrollment QR. Public-CORS so a fresh web device can reach it.
+/// Complete an authenticated enrollment ceremony after the human has compared the
+/// SAS. Only now is the encrypted bundle accepted by the server.
+async fn finalize_enrollment_parcel(
+    State(state): State<AppState>,
+    Path(parcel_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<FinalizeEnrollmentParcelRequestV1>,
+) -> Result<StatusCode, ApiError> {
+    let mailbox_id = authorize_mailbox(
+        &state.pool,
+        &headers,
+        "BlackspaceAdmin",
+        CapabilityKind::Admin,
+        "admin_capability_verifier",
+    )
+    .await?;
+    let ciphertext =
+        validate_sized_ciphertext(&request.ciphertext, request.size_class, &SIZE_CLASSES)?;
+    let nonce = URL_SAFE_NO_PAD
+        .decode(&request.nonce)
+        .map_err(|_| ApiError::invalid_request())?;
+    if nonce.len() != 12 || URL_SAFE_NO_PAD.encode(nonce) != request.nonce {
+        return Err(ApiError::invalid_request());
+    }
+    let result = sqlx::query(
+        "UPDATE enrollment_parcels
+         SET nonce=$1,size_class=$2,ciphertext=$3,finalized_at=now()
+         WHERE id=$4 AND mailbox_id=$5 AND finalized_at IS NULL
+           AND claimed_at IS NULL AND expires_at>now()",
+    )
+    .bind(&request.nonce)
+    .bind(request.size_class as i32)
+    .bind(ciphertext)
+    .bind(parcel_id)
+    .bind(mailbox_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if result.rows_affected() != 1 {
+        return Err(ApiError::version_conflict());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Poll an enrollment parcel using the one-time bearer from the new-device offer.
+/// Pending responses expose only the trusted ephemeral key. A ready response is
+/// consumed atomically and contains the encrypted account bundle.
 async fn claim_enrollment_parcel(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -720,7 +767,7 @@ async fn claim_enrollment_parcel(
     let digest = verifier(CapabilityKind::Enroll, raw).map_err(|_| ApiError::not_found())?;
     let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     let row = sqlx::query(
-        "SELECT id, eph_pub, nonce, size_class, ciphertext FROM enrollment_parcels
+        "SELECT id, eph_pub, nonce, size_class, ciphertext, finalized_at FROM enrollment_parcels
          WHERE verifier=$1 AND claimed_at IS NULL AND expires_at > now()
          FOR UPDATE SKIP LOCKED",
     )
@@ -729,18 +776,32 @@ async fn claim_enrollment_parcel(
     .await
     .map_err(ApiError::internal)?
     .ok_or_else(ApiError::not_found)?;
-    let parcel_id: Uuid = row.get("id");
-    sqlx::query("UPDATE enrollment_parcels SET claimed_at=now() WHERE id=$1")
-        .bind(parcel_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(ApiError::internal)?;
+    let ready = row
+        .get::<Option<OffsetDateTime>, _>("finalized_at")
+        .is_some();
+    if ready {
+        let parcel_id: Uuid = row.get("id");
+        sqlx::query("UPDATE enrollment_parcels SET claimed_at=now() WHERE id=$1")
+            .bind(parcel_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     tx.commit().await.map_err(ApiError::internal)?;
     Ok(Json(ClaimEnrollmentParcelResponseV1 {
+        status: if ready {
+            EnrollmentParcelStatusV1::Ready
+        } else {
+            EnrollmentParcelStatusV1::PendingConfirmation
+        },
         eph_pub: row.get("eph_pub"),
         nonce: row.get("nonce"),
-        size_class: row.get::<i32, _>("size_class") as usize,
-        ciphertext: URL_SAFE_NO_PAD.encode(row.get::<Vec<u8>, _>("ciphertext")),
+        size_class: row
+            .get::<Option<i32>, _>("size_class")
+            .map(|value| value as usize),
+        ciphertext: row
+            .get::<Option<Vec<u8>>, _>("ciphertext")
+            .map(|value| URL_SAFE_NO_PAD.encode(value)),
     }))
 }
 
@@ -806,14 +867,19 @@ async fn list_devices(
     }))
 }
 
-/// Mark a device revoked in the registry. Surgical secret re-keying is a follow-up;
-/// the secure panic button today is rotating the read capability (all devices
-/// re-enroll). Kept admin-gated and idempotent.
-async fn revoke_device(
+/// Secure v1 device removal. Device credentials are mailbox-wide in protocol v1,
+/// so an individual stolen device cannot be cut off without also invalidating the
+/// credentials held by every other secondary device. This operation atomically:
+///   * rotates read and administrator capability verifiers,
+///   * overwrites the shared state with a blob encrypted under a new client root,
+///   * revokes every registered device except the caller.
+/// The retained device persists the new raw secrets only after this transaction
+/// succeeds; all other devices must complete the authenticated enrollment again.
+async fn secure_device_reset(
     State(state): State<AppState>,
-    Path(device_id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<StatusCode, ApiError> {
+    Json(request): Json<SecureDeviceResetRequestV1>,
+) -> Result<Json<SecureDeviceResetResponseV1>, ApiError> {
     let mailbox_id = authorize_mailbox(
         &state.pool,
         &headers,
@@ -822,13 +888,118 @@ async fn revoke_device(
         "admin_capability_verifier",
     )
     .await?;
-    sqlx::query("UPDATE mailbox_devices SET revoked_at=now() WHERE id=$1 AND mailbox_id=$2 AND revoked_at IS NULL")
-        .bind(device_id)
+    // Re-check the presented administrator credential while holding the mailbox
+    // row lock. Without this, two concurrent resets authenticated with the same
+    // old credential could both pass the preflight check and the second could
+    // overwrite the first reset after its credentials had already been rotated.
+    let presented_admin = verifier(
+        CapabilityKind::Admin,
+        authorization_capability(&headers, "BlackspaceAdmin")?,
+    )
+    .map_err(|_| ApiError::unauthorized())?;
+    if request.expected_mls_state_version <= 0 {
+        return Err(ApiError::invalid_request());
+    }
+    if request.revoke_deposit_capability_ids.len() > 16 {
+        return Err(ApiError::invalid_request());
+    }
+    let read = decode_verifier(&request.read_capability_verifier)
+        .map_err(|_| ApiError::invalid_request())?;
+    let admin = decode_verifier(&request.admin_capability_verifier)
+        .map_err(|_| ApiError::invalid_request())?;
+    if bool::from(read.ct_eq(&admin)) {
+        return Err(ApiError::invalid_request());
+    }
+    let ciphertext = validate_sized_ciphertext(
+        &request.mls_state_ciphertext,
+        request.mls_state_size_class,
+        &MLS_STATE_SIZE_CLASSES,
+    )?;
+
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let locked_mailbox = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM mailboxes
+         WHERE id=$1 AND admin_capability_verifier=$2 AND disabled_at IS NULL
+         FOR UPDATE",
+    )
+    .bind(mailbox_id)
+    .bind(presented_admin.as_slice())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    if locked_mailbox.is_none() {
+        return Err(ApiError::unauthorized());
+    }
+    let current_device = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM mailbox_devices
+         WHERE id=$1 AND mailbox_id=$2 AND revoked_at IS NULL FOR UPDATE",
+    )
+    .bind(request.current_device_id)
+    .bind(mailbox_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    if current_device.is_none() {
+        return Err(ApiError::unauthorized());
+    }
+    let current_version: i64 =
+        sqlx::query_scalar("SELECT version FROM mls_state_blobs WHERE mailbox_id=$1 FOR UPDATE")
+            .bind(mailbox_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(ApiError::version_conflict)?;
+    let next = cas_next_version(Some(current_version), request.expected_mls_state_version)
+        .ok_or_else(ApiError::version_conflict)?;
+
+    sqlx::query(
+        "UPDATE mls_state_blobs
+         SET version=$1,size_class=$2,ciphertext=$3,updated_at=now()
+         WHERE mailbox_id=$4",
+    )
+    .bind(next)
+    .bind(request.mls_state_size_class as i32)
+    .bind(ciphertext)
+    .bind(mailbox_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    sqlx::query(
+        "UPDATE mailboxes SET read_capability_verifier=$1,admin_capability_verifier=$2 WHERE id=$3",
+    )
+    .bind(read.as_slice())
+    .bind(admin.as_slice())
+    .bind(mailbox_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| map_conflict(error, "capability_conflict"))?;
+    let revoked_devices = sqlx::query(
+        "UPDATE mailbox_devices SET revoked_at=now()
+         WHERE mailbox_id=$1 AND id<>$2 AND revoked_at IS NULL",
+    )
+    .bind(mailbox_id)
+    .bind(request.current_device_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?
+    .rows_affected();
+    if !request.revoke_deposit_capability_ids.is_empty() {
+        sqlx::query(
+            "UPDATE deposit_capabilities SET revoked_at=now()
+             WHERE mailbox_id=$1 AND id=ANY($2) AND revoked_at IS NULL",
+        )
         .bind(mailbox_id)
-        .execute(&state.pool)
+        .bind(&request.revoke_deposit_capability_ids)
+        .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
-    Ok(StatusCode::NO_CONTENT)
+    }
+    tx.commit().await.map_err(ApiError::internal)?;
+
+    Ok(Json(SecureDeviceResetResponseV1 {
+        version: next,
+        revoked_devices,
+    }))
 }
 
 async fn publish_key_packages(

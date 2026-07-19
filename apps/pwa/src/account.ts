@@ -184,42 +184,70 @@ export function parseEnrollmentOffer(value: string): { parcelId: string; nPub: s
   };
 }
 
-export interface SealedParcel {
+export interface EnrollmentParcelRequest {
   parcel_verifier: string;
   eph_pub: string;
-  nonce: string;
-  size_class: number;
-  ciphertext: string;
   expires_at: number;
 }
 
-// Trusted (enrolled) device: seal the enrollment bundle to the new device's key.
-export async function sealEnrollmentParcel(
+export interface PreparedEnrollmentParcel {
+  parcelId: string;
+  nPub: string;
+  ePub: string;
+  key: CryptoKey;
+  sas: string;
+  request: EnrollmentParcelRequest;
+}
+
+export interface FinalizedEnrollmentParcel {
+  nonce: string;
+  size_class: number;
+  ciphertext: string;
+}
+
+// Trusted device, stage one: derive the authenticated channel and park only the
+// ephemeral public key. Account capabilities do not enter the payload yet.
+export async function prepareEnrollmentParcel(
   offer: { parcelId: string; nPub: string; claimSecret: string },
-  bundle: EnrollmentBundle,
-): Promise<{ parcel: SealedParcel; sas: string }> {
+): Promise<PreparedEnrollmentParcel> {
   const keys = await ephemeral();
   const ePub = await publicRaw(keys.publicKey);
   const { key, raw } = await sharedKey(keys.privateKey, offer.nPub, offer.parcelId);
+  return {
+    parcelId: offer.parcelId,
+    nPub: offer.nPub,
+    ePub,
+    key,
+    sas: sasFrom(raw),
+    request: {
+      parcel_verifier: await capabilityVerifierEnroll(offer.claimSecret),
+      eph_pub: ePub,
+      expires_at: Math.floor(Date.now() / 1000) + 60 * 60,
+    },
+  };
+}
+
+// Trusted device, stage two: called only after the human confirms that both
+// screens show the same SAS. This is the first point where account secrets move.
+export async function finalizeEnrollmentParcel(
+  prepared: PreparedEnrollmentParcel,
+  bundle: EnrollmentBundle,
+): Promise<FinalizedEnrollmentParcel> {
   const plaintext = enc.encode(JSON.stringify(bundle));
   const sizeClass = chooseClass(12 + 16 + 4 + plaintext.length, PARCEL_SIZE_CLASSES);
   const inner = randomBytes(sizeClass - 16);
   new DataView(inner.buffer).setUint32(0, plaintext.length);
   inner.set(plaintext, 4);
   const nonce = randomBytes(12);
-  const aad = enc.encode(`blackspace:enroll:v1:${offer.parcelId}:${offer.nPub}:${ePub}`);
-  const gcm = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce as BufferSource, additionalData: aad as BufferSource }, key, inner as BufferSource));
-  return {
-    parcel: {
-      parcel_verifier: await capabilityVerifierEnroll(offer.claimSecret),
-      eph_pub: ePub,
-      nonce: base64Url(nonce),
-      size_class: sizeClass,
-      ciphertext: base64Url(gcm),
-      expires_at: Math.floor(Date.now() / 1000) + 60 * 60,
-    },
-    sas: sasFrom(raw),
-  };
+  const aad = enc.encode(`blackspace:enroll:v1:${prepared.parcelId}:${prepared.nPub}:${prepared.ePub}`);
+  const gcm = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce as BufferSource, additionalData: aad as BufferSource }, prepared.key, inner as BufferSource));
+  return { nonce: base64Url(nonce), size_class: sizeClass, ciphertext: base64Url(gcm) };
+}
+
+// New device: derive the SAS as soon as stage one appears. It can authenticate the
+// channel now, but cannot receive or decrypt any reusable account secret yet.
+export async function enrollmentSas(offer: EnrollmentOffer, ephPub: string): Promise<string> {
+  return sasFrom((await sharedKey(offer.privateKey, ephPub, offer.parcelId)).raw);
 }
 
 // New device: open the claimed parcel with its ephemeral private key.

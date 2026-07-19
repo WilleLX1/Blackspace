@@ -151,6 +151,58 @@
         }
       }
     },
+    "/v1/enroll/parcels/{parcel_id}": {
+      "put": {
+        "tags": [],
+        "operationId": "api_finalize_enrollment_parcel",
+        "parameters": [
+          {
+            "name": "parcel_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FinalizeEnrollmentParcelRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/info": {
       "get": {
         "tags": [],
@@ -334,26 +386,42 @@
         }
       }
     },
-    "/v1/mailbox/devices/{device_id}": {
-      "delete": {
+    "/v1/mailbox/devices/secure-reset": {
+      "post": {
         "tags": [],
-        "operationId": "api_revoke_device",
-        "parameters": [
-          {
-            "name": "device_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
+        "operationId": "api_secure_device_reset",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecureDeviceResetRequestV1"
+              }
             }
-          }
-        ],
+          },
+          "required": true
+        },
         "responses": {
-          "204": {
-            "description": ""
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecureDeviceResetResponseV1"
+                }
+              }
+            }
           },
           "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemV1"
+                }
+              }
+            }
+          },
+          "409": {
             "description": "",
             "content": {
               "application/json": {
@@ -666,24 +734,34 @@
       "ClaimEnrollmentParcelResponseV1": {
         "type": "object",
         "required": [
-          "eph_pub",
-          "nonce",
-          "size_class",
-          "ciphertext"
+          "status",
+          "eph_pub"
         ],
         "properties": {
           "ciphertext": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "eph_pub": {
             "type": "string"
           },
           "nonce": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "size_class": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "minimum": 0
+          },
+          "status": {
+            "$ref": "#/components/schemas/EnrollmentParcelStatusV1"
           }
         }
       },
@@ -785,6 +863,13 @@
           }
         }
       },
+      "EnrollmentParcelStatusV1": {
+        "type": "string",
+        "enum": [
+          "pending_confirmation",
+          "ready"
+        ]
+      },
       "EnvelopeV1": {
         "type": "object",
         "required": [
@@ -849,6 +934,27 @@
           },
           "registration_invites": {
             "type": "boolean"
+          }
+        }
+      },
+      "FinalizeEnrollmentParcelRequestV1": {
+        "type": "object",
+        "description": "Stage two of enrollment, uploaded only after the trusted device confirms the\nSAS. The payload is encrypted to the new device's ephemeral public key.",
+        "required": [
+          "nonce",
+          "size_class",
+          "ciphertext"
+        ],
+        "properties": {
+          "ciphertext": {
+            "type": "string"
+          },
+          "nonce": {
+            "type": "string"
+          },
+          "size_class": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },
@@ -980,19 +1086,13 @@
       },
       "ParkEnrollmentParcelRequestV1": {
         "type": "object",
-        "description": "A one-time enrollment parcel parked by an already-enrolled device for a new\ndevice to claim. The ciphertext is sealed to the new device's ephemeral public\nkey (carried in `eph_pub`); the server sees only opaque bytes and never a secret.",
+        "description": "Stage one of enrollment. Only the trusted device's ephemeral public key is\nparked here. No reusable account secret is uploaded until both screens have\ndisplayed the same short-authentication string and the trusted user approves.",
         "required": [
           "parcel_verifier",
           "eph_pub",
-          "nonce",
-          "size_class",
-          "ciphertext",
           "expires_at"
         ],
         "properties": {
-          "ciphertext": {
-            "type": "string"
-          },
           "eph_pub": {
             "type": "string"
           },
@@ -1000,15 +1100,8 @@
             "type": "integer",
             "format": "int64"
           },
-          "nonce": {
-            "type": "string"
-          },
           "parcel_verifier": {
             "type": "string"
-          },
-          "size_class": {
-            "type": "integer",
-            "minimum": 0
           }
         }
       },
@@ -1269,6 +1362,66 @@
         "properties": {
           "ok": {
             "type": "boolean"
+          }
+        }
+      },
+      "SecureDeviceResetRequestV1": {
+        "type": "object",
+        "description": "Atomically replaces the shared mailbox credentials and re-encrypts the shared\nMLS state under a new account root. Because v1 devices share mailbox-wide\ncredentials, every device except the caller is revoked and must be re-enrolled.",
+        "required": [
+          "current_device_id",
+          "read_capability_verifier",
+          "admin_capability_verifier",
+          "expected_mls_state_version",
+          "mls_state_size_class",
+          "mls_state_ciphertext"
+        ],
+        "properties": {
+          "admin_capability_verifier": {
+            "type": "string"
+          },
+          "current_device_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expected_mls_state_version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "mls_state_ciphertext": {
+            "type": "string"
+          },
+          "mls_state_size_class": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "read_capability_verifier": {
+            "type": "string"
+          },
+          "revoke_deposit_capability_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        }
+      },
+      "SecureDeviceResetResponseV1": {
+        "type": "object",
+        "required": [
+          "version",
+          "revoked_devices"
+        ],
+        "properties": {
+          "revoked_devices": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },

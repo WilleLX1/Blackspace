@@ -11,18 +11,19 @@ The browser policy permits WebAssembly compilation with the narrow CSP source `'
 
 ## What works
 
-- Responsive messenger shell with onboarding, lock/unlock, contacts, message requests, unread state, drafts, delivery status, retry, offline outbox, fingerprint verification, settings, and recovery export/import.
+- Responsive messenger shell with onboarding, lock/unlock, contacts, message requests, unread state, drafts, delivery status, retry, offline outbox, fingerprint verification, near-fullscreen categorized settings, and recovery export/import.
 - Real two-member MLS conversations through OpenMLS `0.8.1` using `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`.
 - Client-generated Ed25519 identities and signed, single-use OpenMLS key packages.
 - Versioned, validated CBOR application payloads inside padded MLS ciphertext.
 - Argon2id (`64 MiB`, 3 iterations, parallelism 1) encrypted PWA vault in IndexedDB.
 - SQLite Windows vault with secure deletion, bounded journaling, AES-256-GCM records, and a random key protected by both current-user DPAPI and the app-lock passphrase.
 - Encrypted recovery kits that preserve identity/history while excluding reusable MLS group and pending outbox state. Import rotates mailbox access and starts fresh sessions.
+- Confirmed full-device enrollment that withholds account secrets until both devices show the same security code, plus an atomic security reset for lost devices.
 - Rust/Axum/PostgreSQL mailbox with one-time registration invitations, purpose-separated capability verifiers, quotas, expiry, acknowledgement deletion, and key-package claim races handled transactionally.
 - Onion-only default Compose deployment, loopback-only development profile, and optional Caddy HTTPS profile.
 - Managed Tor Expert Bundle sidecar on Windows with cookie-authenticated control port, automatic SOCKS discovery, bootstrap monitoring, clean shutdown, and no clearnet fallback.
 
-Deferred: groups, channels, attachments, calls, reactions, edits, presence, public discovery, moderation, and multi-device synchronization.
+Deferred: groups, channels, attachments, calls, reactions, edits, presence, public discovery, moderation, and surgical single-device re-key distribution.
 
 ## Quick start
 
@@ -210,6 +211,12 @@ The primary device remains the only MLS and identity-key holder. To link a phone
 4. Confirm only when the codes match, then choose a separate local vault passphrase on the companion.
 
 The companion mirrors encrypted history and relays sends while the primary processes MLS. If the primary is offline, companion sends remain queued. Unlink from the primary to rotate mailbox read access and revoke both link deposit capabilities. A linked companion is a trusted device and can observe mailbox metadata; see [SECURITY.md](SECURITY.md#linked-companion-boundary).
+
+### Add or remove a full device
+
+In **Settings > Devices**, choose **Add a full device** and scan the enrollment code shown by the new device. Compare the emoji security code on both screens. Account secrets remain on the trusted device until you choose **Codes match — approve device**.
+
+Choose **Securely remove** if a full device is lost or suspect. Protocol v1 rotates the mailbox read/admin credentials and account-root encryption key, so every other full device is signed out and must be enrolled again. The current device remains active. This blocks future access but cannot erase data a compromised device already decrypted; see [SECURITY.md](SECURITY.md#multi-device-floating-primary-boundary).
 
 Each contact invitation contains a distinct write-only deposit capability and public identity. It never grants mailbox read or administration access. Secrets are URI fragments and are not sent in HTTP request paths.
 

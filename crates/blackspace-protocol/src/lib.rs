@@ -190,16 +190,13 @@ pub struct PutMlsStateResponseV1 {
     pub version: i64,
 }
 
-/// A one-time enrollment parcel parked by an already-enrolled device for a new
-/// device to claim. The ciphertext is sealed to the new device's ephemeral public
-/// key (carried in `eph_pub`); the server sees only opaque bytes and never a secret.
+/// Stage one of enrollment. Only the trusted device's ephemeral public key is
+/// parked here. No reusable account secret is uploaded until both screens have
+/// displayed the same short-authentication string and the trusted user approves.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ParkEnrollmentParcelRequestV1 {
     pub parcel_verifier: String,
     pub eph_pub: String,
-    pub nonce: String,
-    pub size_class: usize,
-    pub ciphertext: String,
     pub expires_at: i64,
 }
 
@@ -208,12 +205,29 @@ pub struct ParkEnrollmentParcelResponseV1 {
     pub parcel_id: Uuid,
 }
 
+/// Stage two of enrollment, uploaded only after the trusted device confirms the
+/// SAS. The payload is encrypted to the new device's ephemeral public key.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct ClaimEnrollmentParcelResponseV1 {
-    pub eph_pub: String,
+pub struct FinalizeEnrollmentParcelRequestV1 {
     pub nonce: String,
     pub size_class: usize,
     pub ciphertext: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrollmentParcelStatusV1 {
+    PendingConfirmation,
+    Ready,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ClaimEnrollmentParcelResponseV1 {
+    pub status: EnrollmentParcelStatusV1,
+    pub eph_pub: String,
+    pub nonce: Option<String>,
+    pub size_class: Option<usize>,
+    pub ciphertext: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -233,6 +247,27 @@ pub struct DeviceV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ListDevicesResponseV1 {
     pub devices: Vec<DeviceV1>,
+}
+
+/// Atomically replaces the shared mailbox credentials and re-encrypts the shared
+/// MLS state under a new account root. Because v1 devices share mailbox-wide
+/// credentials, every device except the caller is revoked and must be re-enrolled.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SecureDeviceResetRequestV1 {
+    pub current_device_id: Uuid,
+    pub read_capability_verifier: String,
+    pub admin_capability_verifier: String,
+    #[serde(default)]
+    pub revoke_deposit_capability_ids: Vec<Uuid>,
+    pub expected_mls_state_version: i64,
+    pub mls_state_size_class: usize,
+    pub mls_state_ciphertext: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SecureDeviceResetResponseV1 {
+    pub version: i64,
+    pub revoked_devices: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -367,6 +402,11 @@ pub fn api_put_mls_state() {}
 pub fn api_park_enrollment_parcel() {}
 
 #[doc(hidden)]
+#[utoipa::path(put, path = "/v1/enroll/parcels/{parcel_id}", request_body = FinalizeEnrollmentParcelRequestV1,
+    params(("parcel_id" = Uuid, Path)), responses((status = 204), (status = 401, body = ProblemV1), (status = 409, body = ProblemV1)))]
+pub fn api_finalize_enrollment_parcel() {}
+
+#[doc(hidden)]
 #[utoipa::path(post, path = "/v1/enroll/parcels/claim",
     responses((status = 200, body = ClaimEnrollmentParcelResponseV1), (status = 404, body = ProblemV1)))]
 pub fn api_claim_enrollment_parcel() {}
@@ -382,9 +422,9 @@ pub fn api_register_device() {}
 pub fn api_list_devices() {}
 
 #[doc(hidden)]
-#[utoipa::path(delete, path = "/v1/mailbox/devices/{device_id}",
-    params(("device_id" = Uuid, Path)), responses((status = 204), (status = 401, body = ProblemV1)))]
-pub fn api_revoke_device() {}
+#[utoipa::path(post, path = "/v1/mailbox/devices/secure-reset", request_body = SecureDeviceResetRequestV1,
+    responses((status = 200, body = SecureDeviceResetResponseV1), (status = 401, body = ProblemV1), (status = 409, body = ProblemV1)))]
+pub fn api_secure_device_reset() {}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -403,10 +443,11 @@ pub fn api_revoke_device() {}
         api_get_mls_state,
         api_put_mls_state,
         api_park_enrollment_parcel,
+        api_finalize_enrollment_parcel,
         api_claim_enrollment_parcel,
         api_register_device,
         api_list_devices,
-        api_revoke_device
+        api_secure_device_reset
     ),
     components(schemas(
         FeatureFlagsV1,
@@ -429,10 +470,14 @@ pub fn api_revoke_device() {}
         PutMlsStateResponseV1,
         ParkEnrollmentParcelRequestV1,
         ParkEnrollmentParcelResponseV1,
+        FinalizeEnrollmentParcelRequestV1,
+        EnrollmentParcelStatusV1,
         ClaimEnrollmentParcelResponseV1,
         RegisterDeviceRequestV1,
         DeviceV1,
         ListDevicesResponseV1,
+        SecureDeviceResetRequestV1,
+        SecureDeviceResetResponseV1,
         EnvelopeV1,
         DepositAcceptedV1,
         PullRequestV1,

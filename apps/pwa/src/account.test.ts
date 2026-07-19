@@ -3,11 +3,13 @@ import { capabilityVerifier, fromBase64Url } from "./crypto";
 import {
   MLS_STATE_SIZE_CLASSES,
   createEnrollmentOffer,
+  enrollmentSas,
+  finalizeEnrollmentParcel,
   openEnrollmentParcel,
   openMlsState,
   parseEnrollmentOffer,
   randomRootSecret,
-  sealEnrollmentParcel,
+  prepareEnrollmentParcel,
   sealMlsState,
   type EnrollmentBundle,
 } from "./account";
@@ -71,35 +73,56 @@ describe("shared MLS-state blob", () => {
   });
 });
 
-describe("one-scan enrollment", () => {
-  it("seals a bundle a new device can open, with matching SAS on both sides", async () => {
+describe("confirmed enrollment", () => {
+  it("shows a matching SAS before sealing a bundle the new device can open", async () => {
     const offer = await createEnrollmentOffer(onion, "https://blackspace.example.com:8443");
     const parsed = parseEnrollmentOffer(offer.qr);
     expect(parsed.parcelId).toBe(offer.parcelId);
     expect(parsed.nPub).toBe(offer.nPub);
 
     const bundle = sampleBundle();
-    const { parcel, sas } = await sealEnrollmentParcel(parsed, bundle);
-    const opened = await openEnrollmentParcel(offer, parcel);
+    const prepared = await prepareEnrollmentParcel(parsed);
+    const newDeviceSas = await enrollmentSas(offer, prepared.ePub);
+    expect(newDeviceSas).toBe(prepared.sas);
+
+    const parcel = await finalizeEnrollmentParcel(prepared, bundle);
+    const claimed = { eph_pub: prepared.ePub, ...parcel };
+    const opened = await openEnrollmentParcel(offer, claimed);
     expect(opened.bundle).toEqual(bundle);
-    expect(opened.sas).toBe(sas);
+    expect(opened.sas).toBe(prepared.sas);
     expect(opened.sas.split(" ")).toHaveLength(4);
   });
 
   it("derives the parcel verifier exactly as the enroll capability kind does", async () => {
     const offer = await createEnrollmentOffer(onion, undefined);
     const parsed = parseEnrollmentOffer(offer.qr);
-    const { parcel } = await sealEnrollmentParcel(parsed, sampleBundle());
-    expect(parcel.parcel_verifier).toBe(await capabilityVerifier("enroll", parsed.claimSecret));
+    const prepared = await prepareEnrollmentParcel(parsed);
+    expect(prepared.request.parcel_verifier).toBe(await capabilityVerifier("enroll", parsed.claimSecret));
+  });
+
+  it("parks no account secret or ciphertext before explicit confirmation", async () => {
+    const offer = await createEnrollmentOffer(onion, undefined);
+    const prepared = await prepareEnrollmentParcel(parseEnrollmentOffer(offer.qr));
+    const parked = JSON.stringify(prepared.request);
+    const bundle = sampleBundle();
+
+    expect(Object.keys(prepared.request).sort()).toEqual(["eph_pub", "expires_at", "parcel_verifier"]);
+    expect(parked).not.toContain(bundle.rootSecret);
+    expect(parked).not.toContain("ciphertext");
   });
 
   it("fails to open when the ephemeral key does not match (MITM/QR swap)", async () => {
     const realOffer = await createEnrollmentOffer(onion, undefined);
     const attackerOffer = await createEnrollmentOffer(onion, undefined);
-    // Trusted device seals against the attacker's swapped QR...
-    const { parcel } = await sealEnrollmentParcel(parseEnrollmentOffer(attackerOffer.qr), sampleBundle());
-    // ...so the real new device cannot open it.
-    await expect(openEnrollmentParcel(realOffer, parcel)).rejects.toThrow();
+    // Trusted device prepares against the attacker's swapped QR, so the security
+    // code on the real new device cannot match and approval must stop here.
+    const prepared = await prepareEnrollmentParcel(parseEnrollmentOffer(attackerOffer.qr));
+    const realSas = await enrollmentSas(realOffer, prepared.ePub);
+    expect(realSas).not.toBe(prepared.sas);
+
+    // Even if a user ignores the mismatch and finalizes, the real device cannot decrypt it.
+    const parcel = await finalizeEnrollmentParcel(prepared, sampleBundle());
+    await expect(openEnrollmentParcel(realOffer, { eph_pub: prepared.ePub, ...parcel })).rejects.toThrow();
   });
 
   it("rejects a malformed enrollment code", () => {

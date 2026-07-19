@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Archive, ArrowLeft, Check, CheckCheck, CircleAlert, Copy, Download,
   Fingerprint, Inbox, KeyRound, Lock, LogOut, MessageCircle, Plus,
@@ -6,10 +6,10 @@ import {
 } from "lucide-react";
 import QRCode from "qrcode";
 import {
-  acknowledgeEnvelopes, claimEnrollmentParcel, claimKeyPackage, createDepositCapability, depositEnvelope,
-  getMlsState, listDevices, ownOrigin, parkEnrollmentParcel, provisionMailbox, publishKeyPackages, pullEnvelopes,
-  putMlsState, registerDevice, revokeDepositCapability, revokeDevice, serverInfo,
-  recoverMailbox, rotateReadCapability, type DeviceRecord,
+  acknowledgeEnvelopes, claimEnrollmentParcel, claimKeyPackage, createDepositCapability, depositEnvelope, diagnosticServerInfo,
+  finalizeEnrollmentParcel as finalizeEnrollmentParcelRequest, getMlsState, listDevices, ownOrigin, parkEnrollmentParcel,
+  provisionMailbox, publishKeyPackages, pullEnvelopes, putMlsState, registerDevice, revokeDepositCapability, serverInfo,
+  recoverMailbox, rotateReadCapability, secureDeviceReset, type DeviceRecord,
 } from "./api";
 import {
   capabilityVerifier, envelopeForPacket,
@@ -31,14 +31,16 @@ import { pairingQrImage } from "./qr";
 import { QrScanControls } from "./qrscan";
 import { createSerialRunner } from "./serial";
 import {
-  createEnrollmentOffer, openEnrollmentParcel, openMlsState, parseEnrollmentOffer, randomRootSecret,
-  sealEnrollmentParcel, sealMlsState, type EnrollmentBundle, type EnrollmentOffer,
+  createEnrollmentOffer, enrollmentSas, finalizeEnrollmentParcel, openEnrollmentParcel, openMlsState,
+  parseEnrollmentOffer, prepareEnrollmentParcel, randomRootSecret, sealMlsState,
+  type EnrollmentBundle, type EnrollmentOffer, type PreparedEnrollmentParcel,
 } from "./account";
 import { RollbackError, serverTransport, withMlsState } from "./mlsstate";
 import { applyShared, extractShared, parseShared, serializeShared, type SharedState } from "./sharedstate";
 
 type Screen = "loading" | "welcome" | "locked" | "messenger";
-type Dialog = "add" | "invite" | "settings" | "security" | "link" | "device" | "diagnostics" | null;
+type Dialog = "add" | "invite" | "settings" | "security" | "link" | "device" | null;
+type SettingsSection = "account" | "devices" | "privacy" | "network" | "recovery";
 
 const initials = (name: string) => name.split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("") || "?";
 const deviceLabel = () => (navigator.userAgent.includes("Mobile") ? "Phone" : "Browser");
@@ -262,6 +264,7 @@ function EnrollDeviceScreen({ onComplete, onCancel }: { onComplete(state: Stored
   const [https, setHttps] = useState("");
   const [session, setSession] = useState<{ offer: EnrollmentOffer; origin: string; image: string }>();
   const [claimed, setClaimed] = useState<{ bundle: EnrollmentBundle; sas: string }>();
+  const [pendingSas, setPendingSas] = useState("");
   const [passphrase, setPassphrase] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState("");
@@ -287,7 +290,15 @@ function EnrollDeviceScreen({ onComplete, onCancel }: { onComplete(state: Stored
         try {
           const parcel = await claimEnrollmentParcel(session.origin, session.offer.claimSecret);
           if (!parcel || cancelled) return;
-          const opened = await openEnrollmentParcel(session.offer, parcel);
+          const sas = await enrollmentSas(session.offer, parcel.eph_pub);
+          if (parcel.status === "pending_confirmation") {
+            if (!cancelled) setPendingSas(sas);
+            return;
+          }
+          if (!parcel.nonce || !parcel.size_class || !parcel.ciphertext) throw new Error("The approved enrollment parcel is incomplete.");
+          const opened = await openEnrollmentParcel(session.offer, {
+            eph_pub: parcel.eph_pub, nonce: parcel.nonce, size_class: parcel.size_class, ciphertext: parcel.ciphertext,
+          });
           if (cancelled) return;
           window.clearInterval(timer);
           setClaimed(opened);
@@ -331,7 +342,11 @@ function EnrollDeviceScreen({ onComplete, onCancel }: { onComplete(state: Stored
       <p>On your other device, open Settings → Devices → Add a device and scan this code.</p>
       {session.image && <img className="pairing-qr" src={session.image} alt="Device enrollment code" />}
       <textarea readOnly rows={3} value={session.offer.qr} />
-      <p className="fine-print">Waiting for your other device to confirm…</p>
+      {pendingSas ? <>
+        <p>Compare this code with the trusted device. Account secrets remain withheld until that device approves:</p>
+        <code>{pendingSas}</code>
+        <p className="fine-print">Waiting for approval on your trusted device…</p>
+      </> : <p className="fine-print">Waiting for your trusted device to scan the code…</p>}
     </> : <>
       <p>Confirm this emoji code matches the one shown on your other device:</p>
       <code>{claimed.sas}</code>
@@ -363,7 +378,7 @@ function LockedScreen({ onUnlock, onReset }: { onUnlock(state: StoredAccount, pa
   </section></main>;
 }
 
-interface ModalProps { title: string; children: React.ReactNode; onClose(): void }
+interface ModalProps { title: string; children: ReactNode; onClose(): void }
 function Modal({ title, children, onClose }: ModalProps) {
   return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="modal" role="dialog" aria-modal="true"><header><h2>{title}</h2><button className="icon-button" onClick={onClose}><X /></button></header>{children}</section></div>;
 }
@@ -373,6 +388,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   const accountRef = useRef(account);
   const [selectedId, setSelectedId] = useState(initial.contacts.find((contact) => contact.status === "accepted")?.id ?? "");
   const [dialog, setDialog] = useState<Dialog>(null);
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("account");
   const [search, setSearch] = useState("");
   const [error, setError] = useState("");
   const [online, setOnline] = useState(navigator.onLine);
@@ -381,7 +397,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   const [inviteQr, setInviteQr] = useState("");
   const [busy, setBusy] = useState(false);
   const [linkSetup, setLinkSetup] = useState<{ pairingId: string; qr: string; qrImage: string; sas: string; linkSecret: string; downlinkCap: string; downlinkCapId: string; uplinkCapId: string }>();
-  const [addDeviceSas, setAddDeviceSas] = useState("");
+  const [addDeviceSetup, setAddDeviceSetup] = useState<{ prepared: PreparedEnrollmentParcel; parcelId: string; deviceId: string }>();
   const [devices, setDevices] = useState<DeviceRecord[]>([]);
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
@@ -395,6 +411,10 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
   }, [passphrase]);
 
   const ownServer = ownOrigin(account.onionOrigin, account.httpsOrigin);
+  const openSettings = (section: SettingsSection = "account") => {
+    setSettingsSection(section);
+    setDialog("settings");
+  };
 
   // Serialize every clone→mutate→persist cycle (poll processing, sends, accepts,
   // retries, mirror snapshots, one-field edits) through one runner so they never
@@ -468,34 +488,85 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     await persist(next);
   }), [ownServer, persist, runExclusive]);
 
-  // Trusted device: upgrade if needed, then seal the enrollment bundle to the new
-  // device's scanned key and park it. The SAS is shown for the human to compare.
+  // Trusted device, stage one: park only an ephemeral public key. The account
+  // bundle is not created until approveDevice confirms the human SAS comparison.
   const addDevice = useCallback(async (offerCode: string): Promise<void> => {
     await ensureUpgraded();
     const base = accountRef.current;
     if (base.rootSecret === undefined) throw new Error("This device is not set up for multi-device.");
     const offer = parseEnrollmentOffer(offerCode);
     const deviceId = crypto.randomUUID();
+    const prepared = await prepareEnrollmentParcel(offer);
+    const parked = await parkEnrollmentParcel(ownServer, base.adminCapability, prepared.request);
+    setAddDeviceSetup({ prepared, parcelId: parked.parcel_id, deviceId });
+  }, [ensureUpgraded, ownServer]);
+
+  // Trusted device, stage two: the button wording is the authorization boundary.
+  // Only after it is pressed do reusable account capabilities enter ciphertext.
+  const approveDevice = useCallback(async (): Promise<void> => {
+    if (!addDeviceSetup) return;
+    const base = accountRef.current;
+    if (base.rootSecret === undefined) throw new Error("This device is not set up for multi-device.");
     const bundle: EnrollmentBundle = {
       rootSecret: base.rootSecret, readCapability: base.readCapability, adminCapability: base.adminCapability,
       identityPublicKey: base.identityPublicKey, mailboxId: base.mailboxId, onionOrigin: base.onionOrigin,
-      httpsOrigin: base.httpsOrigin, displayName: base.displayName, instanceName: base.instanceName, deviceId,
+      httpsOrigin: base.httpsOrigin, displayName: base.displayName, instanceName: base.instanceName, deviceId: addDeviceSetup.deviceId,
     };
-    const { parcel, sas } = await sealEnrollmentParcel(offer, bundle);
-    await parkEnrollmentParcel(ownServer, base.adminCapability, parcel);
-    await registerDevice(ownServer, base.adminCapability, deviceId, deviceLabel());
-    setAddDeviceSas(sas);
-  }, [ensureUpgraded, ownServer]);
+    const parcel = await finalizeEnrollmentParcel(addDeviceSetup.prepared, bundle);
+    // Register the device before making its secret parcel claimable. If the
+    // registry write fails, no reusable account secret has left this device.
+    await registerDevice(ownServer, base.adminCapability, addDeviceSetup.deviceId, deviceLabel());
+    await finalizeEnrollmentParcelRequest(ownServer, base.adminCapability, addDeviceSetup.parcelId, parcel);
+    setAddDeviceSetup(undefined);
+    setDevices(await listDevices(ownServer, base.adminCapability));
+    setSettingsSection("devices"); setDialog("settings");
+  }, [addDeviceSetup, ownServer]);
 
   const refreshDevices = useCallback(async () => {
     try { setDevices(await listDevices(ownServer, accountRef.current.adminCapability)); }
     catch { setDevices([]); }
   }, [ownServer]);
 
-  const removeDevice = useCallback(async (id: string) => {
-    await revokeDevice(ownServer, accountRef.current.adminCapability, id);
-    await refreshDevices();
-  }, [ownServer, refreshDevices]);
+  const secureRemoveDevice = useCallback(async (id: string) => {
+    const target = devices.find((device) => device.id === id);
+    const otherCount = devices.filter((device) => !device.revoked && device.id !== accountRef.current.deviceId).length;
+    if (!confirm(`Securely remove ${target?.label ?? "this device"}? Blackspace will rotate mailbox and shared-state keys, signing out ${otherCount === 1 ? "the other device" : `all ${otherCount} other devices`}. Trusted devices can be added again afterward.`)) return;
+    await runExclusive(async () => {
+      const base = accountRef.current;
+      if (!base.rootSecret || !base.deviceId || base.mlsStateVersion === undefined) throw new Error("Set up multi-device before managing enrolled devices.");
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const currentBlob = await getMlsState(ownServer, base.adminCapability);
+        if (!currentBlob) throw new Error("The shared account state is unavailable.");
+        if (currentBlob.version < base.mlsStateVersion) throw new RollbackError(currentBlob.version, base.mlsStateVersion);
+        const sharedText = await openMlsState(base.rootSecret, base.mailboxId, currentBlob);
+        const nextRootSecret = randomRootSecret();
+        const nextReadCapability = randomCapability();
+        const nextAdminCapability = randomCapability();
+        const rekeyed = await sealMlsState(nextRootSecret, base.mailboxId, sharedText);
+        const reset = await secureDeviceReset(ownServer, base.adminCapability, {
+          current_device_id: base.deviceId,
+          read_capability_verifier: await capabilityVerifier("read", nextReadCapability),
+          admin_capability_verifier: await capabilityVerifier("admin", nextAdminCapability),
+          revoke_deposit_capability_ids: base.companionLink ? [base.companionLink.downlinkCapId, base.companionLink.uplinkCapId] : [],
+          expected_mls_state_version: currentBlob.version,
+          mls_state_size_class: rekeyed.size_class,
+          mls_state_ciphertext: rekeyed.ciphertext,
+        });
+        if (reset === "conflict") continue;
+        const next = applyShared(accountRef.current, parseShared(sharedText));
+        next.rootSecret = nextRootSecret;
+        next.readCapability = nextReadCapability;
+        next.adminCapability = nextAdminCapability;
+        next.mlsStateVersion = reset.version;
+        next.pendingReadCapability = undefined;
+        next.companionLink = undefined;
+        await persist(next);
+        setDevices(await listDevices(ownServer, nextAdminCapability));
+        return;
+      }
+      throw new Error("Another device kept changing the account. Try the secure removal again.");
+    });
+  }, [devices, ownServer, persist, runExclusive]);
 
   const selected = account.contacts.find((contact) => contact.id === selectedId);
   const messages = account.messages.filter((message) => message.contactId === selectedId).sort((a, b) => a.sentAt - b.sentAt);
@@ -905,7 +976,7 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
       const packet = await sealLinkEvent(next.companionLink.linkSecret, next.companionLink.pairingId, "down", next.companionLink.downSeq, event);
       next = structuredClone(accountRef.current); next.companionLink!.downlinkOutbox.push(envelopeForPacket(packet)); await persist(next);
     });
-    setLinkSetup(undefined); setDialog("settings");
+    setLinkSetup(undefined); setSettingsSection("devices"); setDialog("settings");
   };
 
   const cancelDeviceLink = async () => {
@@ -1085,17 +1156,17 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     <aside className="server-rail">
       <button className="server-tile active" aria-label="Blackspace home"><MessageCircle /></button>
       <button className="server-tile" aria-label={account.companionLink?.active ? "Unlink companion" : "Link companion"} onClick={() => account.companionLink?.active ? void unlinkDevice().catch((cause) => setError(errorMessage(cause, "Could not unlink this device."))) : setDialog("link")}><Users /></button>
-      <span className="rail-spacer" /><button className="avatar small" onClick={() => setDialog("settings")}>{initials(account.displayName)}</button>
+      <span className="rail-spacer" /><button className="avatar small" onClick={() => openSettings()}>{initials(account.displayName)}</button>
     </aside>
     <aside className={`conversation-sidebar ${mobileList ? "mobile-visible" : ""}`}>
-      <header className="workspace-header"><div><span className="eyebrow">PRIVATE WORKSPACE</span><h1>{account.instanceName}</h1></div><button className="icon-button" onClick={() => setDialog("settings")}><Settings /></button></header>
+      <header className="workspace-header"><div><span className="eyebrow">PRIVATE WORKSPACE</span><h1>{account.instanceName}</h1></div><button className="icon-button" onClick={() => openSettings()}><Settings /></button></header>
       <div className="search-box"><Search /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search conversations" /></div>
       <nav className="primary-nav"><div className="active"><MessageCircle /> Direct messages <span>{conversations.reduce((sum, contact) => sum + contact.unread, 0) || ""}</span></div><div><Inbox /> Message requests <span>{requests.length || ""}</span></div></nav>
       {requests.length > 0 && <ContactSection title="Requests" contacts={requests} selectedId={selectedId} onSelect={selectContact} />}
       <ContactSection title="Direct messages" contacts={conversations} selectedId={selectedId} onSelect={selectContact} />
       {!filtered.length && <div className="sidebar-empty"><Users /><p>No conversations yet.</p></div>}
       <div className="sidebar-actions"><button className="secondary" onClick={() => setDialog("add")}><UserPlus /> Add contact</button><button className="icon-button" onClick={makeInvite} disabled={busy} title="Create invitation"><Plus /></button></div>
-      <footer><ModeBadge /><button className="network-status" onClick={() => setDialog("diagnostics")} title="Connection diagnostics"><span className={`network-dot ${online ? "online" : ""}`} />{online ? "Connected" : "Offline"}</button></footer>
+      <footer><ModeBadge /><button className="network-status" onClick={() => openSettings("network")} title="Open network settings"><span className={`network-dot ${online ? "online" : ""}`} />{online ? "Connected" : "Offline"}</button></footer>
     </aside>
     <section className={`chat-panel ${!mobileList ? "mobile-visible" : ""}`}>
       {selected ? <>
@@ -1110,10 +1181,9 @@ function Messenger({ initial, passphrase, onLock }: { initial: AccountState; pas
     </section>
     {dialog === "add" && <AddContactModal busy={busy} onAdd={addContact} onClose={() => setDialog(null)} />}
     {dialog === "invite" && <InviteModal value={inviteValue} qr={inviteQr} onClose={() => setDialog(null)} />}
-    {dialog === "settings" && <SettingsModal account={account} mode={transportMode ? modeLabel(transportMode) : "Blocked"} devices={devices} onExport={exportRecovery} onLink={() => setDialog("link")} onAddDevice={() => { setAddDeviceSas(""); setDialog("device"); }} onRemoveDevice={(id) => void removeDevice(id).catch((cause) => setError(errorMessage(cause, "Could not remove the device.")))} onUnlink={() => void unlinkDevice().catch((cause) => setError(errorMessage(cause, "Could not unlink this device.")))} onLock={onLock} onClose={() => setDialog(null)} />}
+    {dialog === "settings" && <SettingsModal account={account} mode={transportMode ? modeLabel(transportMode) : "Blocked"} online={online} initialSection={settingsSection} devices={devices} onExport={exportRecovery} onLink={() => setDialog("link")} onAddDevice={() => { setAddDeviceSetup(undefined); setDialog("device"); }} onSecureRemove={(id) => void secureRemoveDevice(id).catch((cause) => setError(errorMessage(cause, "Could not securely remove the device.")))} onUnlink={() => void unlinkDevice().catch((cause) => setError(errorMessage(cause, "Could not unlink this device.")))} onLock={onLock} onClose={() => setDialog(null)} />}
     {dialog === "link" && <LinkDeviceModal setup={linkSetup} onPrepare={(code) => void prepareDeviceLink(code).catch((cause) => setError(errorMessage(cause, "Could not prepare device pairing.")))} onConfirm={() => void confirmDeviceLink().catch((cause) => setError(errorMessage(cause, "Could not finish device pairing.")))} onClose={() => void cancelDeviceLink()} />}
-    {dialog === "device" && <DeviceModal sas={addDeviceSas} onScan={(code) => void addDevice(code).catch((cause) => setError(errorMessage(cause, "Could not add the device.")))} onClose={() => { setDialog("settings"); setAddDeviceSas(""); }} />}
-    {dialog === "diagnostics" && <DiagnosticsModal account={account} online={online} mode={transportMode ? modeLabel(transportMode) : "Blocked"} onClose={() => setDialog(null)} />}
+    {dialog === "device" && <DeviceModal setup={addDeviceSetup} onScan={(code) => void addDevice(code).catch((cause) => setError(errorMessage(cause, "Could not prepare secure device enrollment.")))} onApprove={() => void approveDevice().catch((cause) => setError(errorMessage(cause, "Could not approve the device.")))} onClose={() => { setSettingsSection("devices"); setDialog("settings"); setAddDeviceSetup(undefined); }} />}
     {dialog === "security" && selected && <SecurityModal account={account} contact={selected} onNickname={async (nickname) => runExclusive(() => mutateState(async (shared) => { const match = shared.contacts.find((item) => item.id === selected.id); if (match) match.localName = nickname.trim() || undefined; return { changed: Boolean(match), value: undefined }; }))} onBlock={async () => { if (confirm(`Block ${selected.localName ?? selected.displayName} and revoke their mailbox access?`)) { try { await blockContact(selected.id); setDialog(null); } catch (cause) { setError(errorMessage(cause, "Could not block this contact.")); } } }} onVerified={async () => { await runExclusive(() => mutateState(async (shared) => { const match = shared.contacts.find((item) => item.id === selected.id); if (match) match.verified = true; return { changed: Boolean(match), value: undefined }; })); setDialog(null); }} onClose={() => setDialog(null)} />}
     {error && <Notice error={error} onClose={() => setError("")} />}
   </main>;
@@ -1145,80 +1215,157 @@ function InviteModal({ value, qr, onClose }: { value: string; qr: string; onClos
   return <Modal title="Your contact invitation" onClose={onClose}><div className="invite-modal"><p>Share this invitation with one person through a trusted channel. It grants write-only access to your mailbox.</p>{qr && <img src={qr} alt="Blackspace contact invitation QR code" />}<textarea readOnly value={value} rows={5} /><button className="primary wide" onClick={async () => { await navigator.clipboard.writeText(value); setCopied(true); }}>{copied ? <><Check /> Copied</> : <><Copy /> Copy invitation</>}</button><small>Revoke this invitation if it is exposed or abused.</small></div></Modal>;
 }
 
-function SettingsModal({ account, mode, devices, onExport, onLink, onAddDevice, onRemoveDevice, onUnlink, onLock, onClose }: { account: AccountState; mode: string; devices: DeviceRecord[]; onExport(): void; onLink(): void; onAddDevice(): void; onRemoveDevice(id: string): void; onUnlink(): void; onLock(): void; onClose(): void }) {
+function SettingsModal({ account, mode, online, initialSection, devices, onExport, onLink, onAddDevice, onSecureRemove, onUnlink, onLock, onClose }: { account: AccountState; mode: string; online: boolean; initialSection: SettingsSection; devices: DeviceRecord[]; onExport(): void; onLink(): void; onAddDevice(): void; onSecureRemove(id: string): void; onUnlink(): void; onLock(): void; onClose(): void }) {
+  const [section, setSection] = useState<SettingsSection>(initialSection);
+  const [filter, setFilter] = useState("");
   const active = devices.filter((device) => !device.revoked);
-  return <Modal title="Settings" onClose={onClose}><div className="settings-profile"><span className="avatar large">{initials(account.displayName)}</span><div><h3>{account.displayName}</h3><p>{account.instanceName}</p></div></div><div className="settings-list"><div><Server /><span><strong>Transport</strong><small>{mode}</small></span></div><div><KeyRound /><span><strong>Identity</strong><small>{account.identityPublicKey.slice(0, 18)}…</small></span></div><div><Server /><span><strong>Server address</strong><small>{account.onionOrigin.replace(/^https?:\/\//, "").slice(0, 22)}…</small></span></div><div><Archive /><span><strong>Local vault</strong><small>Encrypted browser storage</small></span></div></div>
-    <div className="settings-list">
-      <div><Users /><span><strong>Your devices</strong><small>{account.rootSecret ? `${active.length} linked${active.length === 1 ? " (this one)" : ""}` : "Multi-device off — add a device to enable"}</small></span></div>
-      {active.map((device) => <div key={device.id}><MessageCircle /><span><strong>{device.label}{device.id === account.deviceId ? " (this device)" : ""}</strong><small>Added {formatDay(device.enrolled_at * 1000)}</small></span>{device.id !== account.deviceId && <button className="text-button danger" onClick={() => onRemoveDevice(device.id)}>Remove</button>}</div>)}
-    </div>
-    <div className="modal-actions stack">
-      <button className="secondary wide" onClick={onAddDevice}><Plus /> Add a device</button>
-      {account.companionLink?.active ? <button className="secondary wide danger-action" onClick={onUnlink}><Users /> Unlink companion</button> : <button className="secondary wide" onClick={onLink}><Users /> Link a companion (mirror)</button>}
-      <button className="secondary wide" onClick={onExport}><Download /> Export encrypted recovery kit</button>
-      <button className="secondary wide" onClick={onLock}><LogOut /> Lock Blackspace</button>
-    </div><p className="alpha-warning"><CircleAlert /> Private alpha: browser storage cannot guarantee physical erasure of old encrypted pages. Removing a device does not yet re-key the others.</p></Modal>;
+  const sections: Array<{ id: SettingsSection; label: string; detail: string; icon: ReactNode }> = [
+    { id: "account", label: "Account", detail: "Profile and identity", icon: <KeyRound /> },
+    { id: "devices", label: "Devices", detail: `${active.length} enrolled`, icon: <Users /> },
+    { id: "privacy", label: "Privacy & data", detail: "Storage and metadata", icon: <ShieldCheck /> },
+    { id: "network", label: "Network", detail: mode, icon: <Server /> },
+    { id: "recovery", label: "Recovery", detail: "Backup and lock", icon: <Archive /> },
+  ];
+  const visibleSections = sections.filter((item) => `${item.label} ${item.detail}`.toLowerCase().includes(filter.toLowerCase()));
+  const row = (label: string, value: string, icon: ReactNode) => <div className="settings-value-row">{icon}<span><strong>{label}</strong><small>{value}</small></span></div>;
+
+  return <div className="modal-backdrop settings-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <section className="settings-window" role="dialog" aria-modal="true" aria-label="Settings">
+      <aside className="settings-sidebar">
+        <div className="settings-profile"><span className="avatar large">{initials(account.displayName)}</span><div><h3>{account.displayName}</h3><p>{account.instanceName}</p></div></div>
+        <div className="settings-search"><Search /><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Search settings" /></div>
+        <nav>{visibleSections.map((item) => <button key={item.id} className={section === item.id ? "active" : ""} onClick={() => setSection(item.id)}>{item.icon}<span><strong>{item.label}</strong><small>{item.detail}</small></span></button>)}</nav>
+        <span className="settings-sidebar-spacer" />
+        <button className="settings-lock" onClick={onLock}><LogOut /> Lock Blackspace</button>
+      </aside>
+      <div className="settings-main">
+        <header><div><span className="eyebrow">BLACKSPACE SETTINGS</span><h2>{sections.find((item) => item.id === section)?.label}</h2></div><button className="icon-button" onClick={onClose} aria-label="Close settings"><X /></button></header>
+        <div className="settings-scroll">
+          {section === "account" && <section className="settings-page">
+            <div className="settings-page-heading"><div className="modal-icon"><KeyRound /></div><div><h3>Account and identity</h3><p>Your public profile and cryptographic identity. Blackspace does not require email or a phone number.</p></div></div>
+            <div className="settings-card">
+              {row("Display name", account.displayName, <MessageCircle />)}
+              {row("Instance", account.instanceName, <Server />)}
+              {row("Identity key", `${account.identityPublicKey.slice(0, 24)}…`, <Fingerprint />)}
+              {row("Local vault", "Encrypted with your app-lock passphrase", <Lock />)}
+            </div>
+          </section>}
+          {section === "devices" && <section className="settings-page">
+            <div className="settings-page-heading"><div className="modal-icon secure"><Users /></div><div><h3>Authorized devices</h3><p>New devices receive account secrets only after both screens show the same security code and you approve here.</p></div></div>
+            <div className="settings-card device-card-list">
+              {active.length ? active.map((device) => <div className="device-management-row" key={device.id}>
+                <span className={`device-glyph ${device.id === account.deviceId ? "current" : ""}`}><MessageCircle /></span>
+                <span><strong>{device.label}</strong><small>Added {formatDay(device.enrolled_at * 1000)} · {device.id === account.deviceId ? "This device" : `ID ${device.id.slice(0, 8)}`}</small></span>
+                {device.id === account.deviceId ? <em>Current</em> : <button className="secondary danger-action" onClick={() => onSecureRemove(device.id)}>Securely remove</button>}
+              </div>) : <div className="settings-empty"><Users /><p>No registered devices yet.</p></div>}
+            </div>
+            <div className="settings-actions-grid"><button className="primary" onClick={onAddDevice}><Plus /> Add a full device</button>{account.companionLink?.active ? <button className="secondary danger-action" onClick={onUnlink}><Users /> Unlink companion</button> : <button className="secondary" onClick={onLink}><Users /> Link a companion mirror</button>}</div>
+            <p className="settings-security-note"><ShieldCheck /> Secure removal rotates mailbox read/admin access and the shared-state encryption key. Protocol v1 signs out every other full device so trusted ones can be enrolled again. A stolen device may retain data it already decrypted.</p>
+          </section>}
+          {section === "privacy" && <section className="settings-page">
+            <div className="settings-page-heading"><div className="modal-icon secure"><ShieldCheck /></div><div><h3>Privacy and local data</h3><p>Review what Blackspace stores and which metadata the mailbox can observe.</p></div></div>
+            <div className="settings-card">
+              {row("Message content", "End-to-end encrypted before leaving this device", <Lock />)}
+              {row("Local history", "Stored inside the encrypted vault", <Archive />)}
+              {row("Mailbox metadata", "Timing, size class, expiry and capability use", <Server />)}
+              {row("Browser erasure", "Physical erasure of old encrypted pages is not guaranteed", <CircleAlert />)}
+            </div>
+          </section>}
+          {section === "network" && <section className="settings-page">
+            <div className="settings-page-heading"><div className="modal-icon"><Server /></div><div><h3>Network and transport</h3><p>Blackspace keeps Tor and HTTPS transport modes separate and never silently falls back.</p></div></div>
+            <div className="settings-card">
+              {row("Active transport", mode, <ShieldCheck />)}
+              {row("Onion service", account.onionOrigin.replace(/^https?:\/\//, ""), <Server />)}
+              {row("HTTPS gateway", account.httpsOrigin ?? "Not configured", <Server />)}
+              {row("Device network", online ? "Online" : "Offline", <MessageCircle />)}
+              {row("Mailbox", account.mailboxId, <Inbox />)}
+            </div>
+            <ConnectionDiagnostics account={account} />
+          </section>}
+          {section === "recovery" && <section className="settings-page">
+            <div className="settings-page-heading"><div className="modal-icon"><Archive /></div><div><h3>Recovery and access</h3><p>Recovery kits are encrypted client exports. The server cannot recover a lost identity or passphrase.</p></div></div>
+            <div className="settings-card settings-action-card"><div><Download /><span><strong>Encrypted recovery kit</strong><small>Preserves your identity and history for mailbox takeover recovery.</small></span><button className="secondary" onClick={onExport}>Export</button></div><div><LogOut /><span><strong>Lock this device</strong><small>Clears unlocked key material from the running application.</small></span><button className="secondary" onClick={onLock}>Lock now</button></div></div>
+          </section>}
+        </div>
+      </div>
+    </section>
+  </div>;
 }
 
-// Trusted-device side of one-scan enrollment: scan the new device's code, which
-// triggers sealing + parking, then show the SAS emoji to compare across screens.
-function DeviceModal({ sas, onScan, onClose }: { sas: string; onScan(code: string): void; onClose(): void }) {
+// Trusted-device side of staged enrollment. Scanning parks only an ephemeral key;
+// pressing the explicit approval button is the boundary that releases secrets.
+function DeviceModal({ setup, onScan, onApprove, onClose }: { setup?: { prepared: PreparedEnrollmentParcel }; onScan(code: string): void; onApprove(): void; onClose(): void }) {
   const [pasted, setPasted] = useState("");
   const [scanError, setScanError] = useState("");
-  return <Modal title="Add a device" onClose={onClose}><div className="modal-content">{!sas ? <>
+  return <Modal title="Add a device securely" onClose={onClose}><div className="modal-content">{!setup ? <>
     <p>On your new device choose “Add this device to my account,” then scan the code it shows.</p>
     <QrScanControls label="Scan enrollment QR" onValue={(code) => { setScanError(""); onScan(code); }} onError={setScanError} />
     <label>Or paste the enrollment code<textarea rows={4} value={pasted} onChange={(event) => setPasted(event.target.value)} placeholder="blackspace://enroll/v1…" /></label>
     {scanError && <p className="form-error"><CircleAlert size={16} />{scanError}</p>}
-    <button className="primary wide" onClick={() => onScan(pasted)} disabled={!pasted.trim()}>Seal for this device</button>
+    <button className="primary wide" onClick={() => onScan(pasted)} disabled={!pasted.trim()}>Start secure enrollment</button>
   </> : <>
-    <p>Confirm this emoji code matches the one on your new device, then finish there:</p>
-    <code>{sas}</code>
-    <button className="primary wide" onClick={onClose}>Done</button>
+    <div className="modal-icon secure"><ShieldCheck /></div>
+    <p>Compare this code with the new device. No reusable account secret has been uploaded yet.</p>
+    <code>{setup.prepared.sas}</code>
+    <button className="primary wide" onClick={onApprove}><ShieldCheck /> Codes match — approve device</button>
+    <button className="secondary wide" onClick={onClose}>Codes do not match — cancel</button>
   </>}</div></Modal>;
 }
 
-// Live connection check + server details, opened from the footer status. The check
-// re-fetches /v1/info and times it; everything shown is already known to this client.
-function DiagnosticsModal({ account, online, mode, onClose }: { account: AccountState; online: boolean; mode: string; onClose(): void }) {
+type DiagnosticPhase = "checking" | "ok" | "error" | "unconfigured";
+
+// Each probe has an explicit transport. In the native client the Tor probe uses
+// the managed SOCKS client and the HTTPS probe uses the dedicated TLS-only command.
+// These checks never participate in normal mailbox routing or fallback behavior.
+function TransportDiagnostic({ label, origin, transport, revision }: { label: string; origin?: string; transport: "tor" | "https"; revision: number }) {
   const [info, setInfo] = useState<ServerInfo>();
-  const [state, setState] = useState<"checking" | "ok" | "error">("checking");
+  const [phase, setPhase] = useState<DiagnosticPhase>(origin ? "checking" : "unconfigured");
   const [latency, setLatency] = useState<number>();
   const [detail, setDetail] = useState("");
-  const origin = ownOrigin(account.onionOrigin, account.httpsOrigin);
-  const check = useCallback(async () => {
-    setState("checking"); setDetail("");
-    const start = Date.now();
-    try {
-      const result = await serverInfo(origin);
-      setInfo(result); setLatency(Date.now() - start); setState("ok");
-    } catch (cause) {
-      setState("error"); setDetail(errorMessage(cause, "Could not reach the mailbox."));
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!origin) {
+      setInfo(undefined); setLatency(undefined); setDetail(""); setPhase("unconfigured");
+      return () => { cancelled = true; };
     }
-  }, [origin]);
-  useEffect(() => { void check(); }, [check]);
-  const features = info ? Object.entries(info.features).filter(([, on]) => on).map(([name]) => name.replaceAll("_", " ")).join(", ") : "";
-  return <Modal title="Connection diagnostics" onClose={onClose}><div className="modal-content">
-    <div className={`diag-banner ${state}`}>
-      <span className={`network-dot ${state === "ok" ? "online" : ""}`} />
-      <strong>{state === "checking" ? "Checking…" : state === "ok" ? `Reachable${latency !== undefined ? ` · ${latency} ms` : ""}` : "Unreachable"}</strong>
+    setInfo(undefined); setLatency(undefined); setDetail(""); setPhase("checking");
+    const started = performance.now();
+    void diagnosticServerInfo(origin, transport).then((result) => {
+      if (cancelled) return;
+      setInfo(result); setLatency(Math.round(performance.now() - started)); setPhase("ok");
+    }).catch((cause) => {
+      if (cancelled) return;
+      setDetail(errorMessage(cause, `Could not reach the mailbox over ${label}.`)); setPhase("error");
+    });
+    return () => { cancelled = true; };
+  }, [label, origin, revision, transport]);
+
+  const status = phase === "checking" ? "Checking…" : phase === "ok" ? `Reachable${latency !== undefined ? ` · ${latency} ms` : ""}` : phase === "error" ? "Unreachable" : "Not configured";
+  const explanation = detail ? explainErrorMessage(detail) : "";
+  return <article className={`transport-diagnostic ${phase}`}>
+    <header><div><span className={`network-dot ${phase === "ok" ? "online" : ""}`} /><strong>{label}</strong></div><span>{status}</span></header>
+    <div className="diagnostic-details">
+      <div><Server /><span><strong>Address</strong><small>{origin?.replace(/^https?:\/\//, "") ?? "No HTTPS gateway advertised"}</small></span></div>
+      <div><ShieldCheck /><span><strong>Route</strong><small>{transport === "tor" ? "Managed Tor · isolated SOCKS circuit" : "Direct HTTPS · TLS required"}</small></span></div>
+      {info && <>
+        <div><Server /><span><strong>Instance</strong><small>{info.instance_name}</small></span></div>
+        <div><KeyRound /><span><strong>Protocol</strong><small>v{info.protocol_versions.join(", v")}</small></span></div>
+      </>}
     </div>
-    {state === "error" && <><p className="form-error"><CircleAlert size={16} />{detail}</p>{explainErrorMessage(detail) && <p className="toast-detail">{explainErrorMessage(detail)}</p>}</>}
-    <div className="settings-list">
-      <div><Server /><span><strong>Transport</strong><small>{mode}</small></span></div>
-      <div><Server /><span><strong>Server address</strong><small>{origin.replace(/^https?:\/\//, "")}</small></span></div>
-      <div><MessageCircle /><span><strong>Browser network</strong><small>{online ? "Online" : "Offline"}</small></span></div>
-      <div><KeyRound /><span><strong>Mailbox ID</strong><small>{account.mailboxId}</small></span></div>
-      <div><Users /><span><strong>Multi-device</strong><small>{account.rootSecret ? `On · this device ${account.deviceId?.slice(0, 8)}…` : "Off"}</small></span></div>
+    {phase === "error" && <div className="diagnostic-error"><CircleAlert /><span><strong>{detail}</strong>{explanation && <small>{explanation}</small>}</span></div>}
+  </article>;
+}
+
+function ConnectionDiagnostics({ account }: { account: AccountState }) {
+  const [revision, setRevision] = useState(0);
+  return <section className="connection-diagnostics" aria-labelledby="connection-diagnostics-title">
+    <header><div><h4 id="connection-diagnostics-title">Connection diagnostics</h4><p>Independent reachability checks for each configured transport. Blackspace never switches between them automatically.</p></div><button className="secondary" onClick={() => setRevision((value) => value + 1)}><RefreshCw size={15} /> Recheck both</button></header>
+    <div className="diagnostic-grid">
+      <TransportDiagnostic label="Tor" origin={account.onionOrigin} transport="tor" revision={revision} />
+      <TransportDiagnostic label="HTTPS" origin={account.httpsOrigin} transport="https" revision={revision} />
     </div>
-    {info && <div className="settings-list">
-      <div><Server /><span><strong>Instance</strong><small>{info.instance_name}</small></span></div>
-      <div><ShieldCheck /><span><strong>Protocol</strong><small>v{info.protocol_versions.join(", v")}</small></span></div>
-      <div><Archive /><span><strong>Max message</strong><small>{Math.round(info.maximum_envelope_bytes / 1024)} KB</small></span></div>
-      <div><ShieldCheck /><span><strong>Features</strong><small>{features || "none"}</small></span></div>
-    </div>}
-    <button className="secondary wide" onClick={() => void check()} disabled={state === "checking"}><RefreshCw size={16} /> Recheck</button>
-  </div></Modal>;
+  </section>;
 }
 
 function LinkDeviceModal({ setup, onPrepare, onConfirm, onClose }: { setup?: { qr: string; qrImage: string; sas: string }; onPrepare(code: string): void; onConfirm(): void; onClose(): void }) {
